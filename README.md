@@ -1,13 +1,16 @@
-# coldstore — hot/warm/cold paging for agent workspaces, with an encrypted cloud cold tier
+# coldstore — virtual memory for agent workspaces: a Pager with proof-gated eviction and an encrypted cloud cold tier
 
 `coldstore` is the storage-tier control plane extracted from a two-host, multi-agent
 production setup (a macOS control host + a Linux GPU/storage host). It answers one
 question deterministically: **which directories may leave local disk, when, and what
 evidence must exist before a single source byte is deleted.**
 
-It is not a backup tool and not a sync tool. It is a *pager*: workspaces are pages, the
-local disk is RAM, a consumer cloud drive is swap, and every transition is gated by
-fail-closed checks that were each added after a real incident (see `docs/LESSONS.md`).
+It is not a backup tool, not a sync tool, and not a cloud-drive client. It is a *pager*:
+workspaces are pages, the local disk is RAM, a consumer cloud drive is swap, and every
+transition is gated by fail-closed checks that were each added after a real incident
+(see `docs/LESSONS.md`). The cloud adapter is one replaceable module; the parts with
+identity are the page table, the liveness/eviction planner and the **proof-gated
+eviction** chain that must pass before a single source byte is deleted.
 
 ```text
  ws (CLI)  ──index──▶  page table (sqlite)  ──plan──▶  HOT / WARM / COLD / PINNED
