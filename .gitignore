@@ -1,0 +1,34 @@
+# runtime state — never commit
+*.bak*
+*.db
+*.env
+*.gz
+*.jsonl
+*.lock
+*.pyc
+*.sqlite3
+*.tsv
+.secrets/
+__pycache__/
+config/pager_paths.json
+config/workspace_pager_policy.json
+manifests/
+page_cache/
+version_parts/
+# private manifests / runtime — never commit
+*.log
+*.pid
+*.gpg
+*.key
+*.pem
+*.manifest
+*.ledger
+audit/
+state/
+backup/
+cache/
+runtime/
+restore-*/
+HANDOFF.md
+SOURCE_STATE.txt
+*REFERENCE*.txt

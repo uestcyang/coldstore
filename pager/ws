@@ -1,0 +1,3394 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""ws — 工作区索引 CLI(<date> operator directive,workspace-handoff 规范固化为派单机制)
+
+背景:skill `workspace-handoff`(<date> 立)规定了 HANDOFF.md 四大块规范,
+handoff_lint.py(<date>)能体检覆盖率/符合度,但派单流水线零接线——worker
+干活不知道先查索引、不知道完工要记账。本工具是那条缺失的胶水:
+
+  ws find <关键词...>   按关键词命中工作区,打印 这是什么/产线/⭐skill/当前态
+  ws map [关键词...]    多级总览:领域 → 产线 → 工作区(可 --json)
+  ws route <需求...>   按需求返回候选入口和确定性下钻命令(可 --json)
+  ws page ...          工作区热温冷页表、租约、预取与恢复入口
+  ws list                全量索引一览
+  ws show <路径|名称>    打印该工作区 HANDOFF.md 的「当前态」+「必用skill」两块
+  ws new <路径> [...]    建区(已有 HANDOFF.md 时绝不覆盖,exit 2)
+  ws log <路径> --chain --what --why   修改日志追加一行(只追加,原子写)
+  ws state <路径> --chain --progress --next-gate [--what] [--blocker]   原子刷新当前任务游标
+  ws dep <路径> --add <依赖工作区> --chain   原子去重声明当前跨区依赖
+  ws skill <路径> --add [--star] [--note]   必用skill 去重追加(永不删除)
+  ws fix <路径> [--force]    HANDOFF.md 缺块补齐(转调 handoff_scaffold.py --fix,只补结构不编内容)
+  ws check <路径>             HANDOFF.md 合规检查(转调 handoff_scaffold.py --check,JSON 报告)
+  ws index --rebuild     重建索引缓存
+  ws lint [args...]      转调 handoff_lint.py(原样转发退出码)
+  ws --selftest [--json]  自检 ws 的关键不变量(写/并发/读降级),临时目录运行,绝不碰真缓存
+
+索引来源三路合并:
+  ① 两机 find 出的所有 HANDOFF.md(本机直接读,对侧经 ssh 读文本)
+  ② handoff_lint.py --json 判定"够格但缺 HANDOFF"的目录(仅本机)
+  ③ ~/.coldstore/dispatch/{done,failed}/*/prompt.md 的路径证据:先归属到已知工作区根;
+    只有本机真存在、带项目标记且被 >=2 个不同派单引用的根才可新晋升。
+    results.json/.venv/runs/模型权重等任务产物只能归属,绝不单独成为工作区。
+
+硬约束(用户 <date> 令):
+  - 零外网请求:只读本机文件系统 + 内网 ssh(host-b/host-a)。
+  - ssh 必须带 -o ConnectTimeout=6;对侧不可达时降级只用本机索引,绝不整体不可用。
+  - 不新建任何定时器/守护进程/轮询:索引缓存(~/.coldstore/state/workspaces.json)
+    过期(>6h)仍立即返回最后一份合法缓存并显式标 stale；只有维护任务或
+    `ws index --rebuild` 才允许扫描双机重建，查询热路径永不暗中重扫。
+  - `ws log` / `ws skill` 是原子追加:用独立 .lock 文件 flock 序列化并发 worker
+    写入(注意:不能靠"open 原 inode 再 flock 再 rename"这种写法——rename 会
+    换 inode,导致排队等锁的第二个进程锁住的是被替换掉的旧 inode,读到旧内容,
+    覆盖掉第一个进程刚写的追加,是本工具设计时踩过一次的坑,已改用独立锁文件)。
+
+⚠ <date> addendum:`HANDOFF.md.lock` 是 flock 用的 advisory lock 文件,
+   flock 失败/进程异常退出后会留 0 字节 .lock 残留在工作区根部。**功能上无害**
+   (advisory 锁、文件本身不存在都不影响后续 flock),但若工作区是 git 仓库,
+   会被 `git add -A` 误提交。请在工作区 `.gitignore` 里加 `*.lock`(本工具
+   不会去自动删那些残留 .lock,可能有活锁;也不要改锁的实现——并发正确性
+   比整洁重要)。已知当前机器共残留 N 个 .lock,均由本工具历史产生,无害。
+"""
+
+import argparse
+import calendar
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+import platform
+import re
+import shlex
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+
+BIN_DIR = os.path.dirname(os.path.abspath(__file__))
+if BIN_DIR not in sys.path:
+    sys.path.insert(0, BIN_DIR)
+import workspace_pager as pager
+
+WORKSPACE_ARCHIVE_TOOL = (
+    "/Users/user/.coldstore/archive/workspace_archive.py"
+    if platform.system() == "Darwin"
+    else "/home/user/.coldstore/archive/workspace_archive.py"
+)
+
+# <date>: 记账时间戳强制走**系统时区**,不跟调用方进程的 TZ 环境变量。
+# 病因(实测,不是推断):hostb 的 dispatcher 带 `TZ=Asia/Shanghai`(视频线配额按北京日期算,
+# 那是有意设计,不动它),于是它起的每个 worker 调 `ws log` 写出来的时间戳都是北京时间,
+# 而 Mac 侧 worker 写的是 PDT —— 同一份 HANDOFF 里两机记账**差 15 小时**,时间序是乱的。
+# HANDOFF 是主脑每拍必读的第一份材料,它按"最新几行"判线情,时间乱 = 判断依据乱。
+# 两机系统时区实测均为 PDT -0700,所以清掉 TZ 后 tzset() 读 /etc/localtime 即可两机对齐。
+# ⛔ 不要改成硬编码时区,也不要去改 dispatcher 的 TZ(会挪动视频线配额的重置时刻)。
+os.environ.pop("TZ", None)
+try:
+    time.tzset()          # Windows 无此函数;本产线只有 mac/linux
+except AttributeError:
+    pass
+
+HOME = os.path.expanduser("~")
+IS_MAC = platform.system() == "Darwin"
+HOST = "mac" if IS_MAC else "hostb"
+PEER_HOST = "hostb" if IS_MAC else "mac"
+PEER_SSH = "user@host-b" if IS_MAC else "user@host-a"
+PEER_HOME = "/home/user" if IS_MAC else "/Users/user"
+
+DISPATCH = os.path.join(HOME, ".coldstore", "dispatch")
+STATE_DIR = os.path.join(HOME, ".coldstore", "state")
+CACHE_FILE = os.path.join(STATE_DIR, "workspaces.json")
+FUNCTION_FOUNDRY_INDEX_PATHS = (
+    os.path.join(STATE_DIR, "function_foundry_index.jsonl"),
+    "/home/user/tools/function_foundry_index.jsonl",
+)
+FUNCTION_FOUNDRY_STORAGE_PATHS = (
+    os.path.join(STATE_DIR, "function_foundry_storage.json"),
+    "/home/user/tools/function_foundry_storage.json",
+)
+CAPABILITY_INDEX_PATHS = (
+    os.path.join(STATE_DIR, "capability_index.sqlite3"),
+    "/home/user/tools/capability_index.sqlite3",
+)
+CAPABILITY_REMOTE_SCRIPT = "/home/user/tools/bin/function_foundry_index.py"
+CAPABILITY_REMOTE_INDEX = "/home/user/tools/capability_index.sqlite3"
+CAPABILITY_QUERY_TIMEOUT_SEC = 8
+CAPABILITY_ROUTER_ENGINE = "aurelio-labs/semantic-router"
+CAPABILITY_ROUTER_PACKAGE_VERSION = "0.1.16"
+CAPABILITY_ROUTER_SOURCE_COMMIT = "8a7b5547e0a58e63b81fce5acceadf2a986275e9"
+CAPABILITY_ROUTER_WHEEL_SHA256 = "b09a0cda7cbf60ad2dad677ed65c0974e816ea5494a49f33ab06316eab92bcf5"
+CAPABILITY_ROUTER_LITELLM_FLOOR = "1.83.7"
+CAPABILITY_ROUTER_LITELLM_VERSION = "1.98.0"
+CAPABILITY_ROUTER_SCORE_THRESHOLD = 0.55
+CAPABILITY_ROUTER_AGGREGATION = "max"
+CAPABILITY_ROUTER_MANIFEST_NAME = "capability_router_manifest.json"
+CAPABILITY_RETRIEVAL_CONTRACT_VERSION = 3
+CACHE_TTL_SEC = 6 * 3600
+INDEX_SCHEMA_VERSION = 4
+LINT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "handoff_lint.py")
+# <date> 收编:handoff_scaffold.py 是 ws 的内部实现,fix/check 子命令转调它。
+# 铁律:不许把 scaffold 的逻辑复制进 ws(同源同进程调用,任一改了另一套会漂);
+# 用 subprocess 调起,确保走 handoff_lint 唯一判据。
+SCAFFOLD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "handoff_scaffold.py")
+
+# 目录名黑名单——与 handoff_lint.py 的 DENY_NAMES 保持同一口径(改一处记得改两处):
+# 系统/工具/缓存目录,不是真工作区。实测 ~/.browser-profile-a 单目录 10万+文件、
+# miniconda3/.gradle/.pub-cache 等同理,不排掉本机 find 会拖到 40-60s+ 甚至超时。
+PRUNE_NAMES = [
+    "Downloads", "Movies", "Music", "Pictures", "Documents", "Applications",
+    "Library", "Public", "Desktop", "miniconda3", "anaconda3", "go", "sdk",
+    ".ssh", ".config", ".local", ".docker", ".android", ".vscode", ".cache",
+    ".cursor", ".trae-cn", ".cline", ".zsh_sessions", ".npm", ".Trash",
+    ".browser-profile-a", ".kimi", ".kimi_openclaw", ".openclaw", ".local-llm",
+    ".agents", ".agent-agent", "d2l-zh", "engine-c", "engine-e",
+    "cloudbase-framework", "miniforge3", "同步盘",
+    "node_modules", ".git", ".venv", "venv", "__pycache__", ".gradle",
+    ".dartServer", ".pub-cache", ".qclaw",
+]
+# 路径级黑名单(名字太通用不能按 basename 一刀切,只能按路径前缀排):
+# dispatch 任务私有临时目录、rebuild-pack 暂存副本、迁移备份——都是 skill 规范里
+# 明确 SKIP 的"不是工作区"的地方,不是真产线。
+PRUNE_PATHS = [
+    "*/.coldstore/dispatch/done", "*/.coldstore/dispatch/failed", "*/.coldstore/dispatch/running",
+    "*/.coldstore/dispatch/work", "*/.coldstore/tmp",
+    # 这些目录可能带历史 HANDOFF.md，但只是 ~/.coldstore 根工作区的实现/运行态子树，
+    # 不是可独立接手的工作区。保留实体和历史，仅从索引候选中剪枝。
+    "*/.coldstore/.claude/worktrees", "*/.coldstore/logs", "*/.coldstore/state",
+    "*/.coldstore/scripts", "*/.coldstore/dispatch/results", "*/.coldstore/archive",
+    os.path.join(HOME, ".agent-agent-g"), os.path.join(HOME, ".agent-agent-e"),
+    os.path.join(HOME, ".agent-shared"), os.path.join(HOME, ".coldstore", "etc"),
+    os.path.join(HOME, ".npm-global"), os.path.join(HOME, "bin"),
+    os.path.join(HOME, "snap"), os.path.join(HOME, "agent-g-sub"),
+    os.path.join(HOME, "engine-a", "engine-a-core"),
+    os.path.join(HOME, "research-runtime"), os.path.join(HOME, "task-dir-a"),
+    os.path.join(HOME, "示例配音目录"),
+    os.path.join(HOME, ".codex"), os.path.join(HOME, ".coldstore", "_deleted"),
+    os.path.join(HOME, ".coldstore", "cron"), os.path.join(HOME, ".coldstore", "plugins"),
+    os.path.join(HOME, ".coldstore", "profiles"), os.path.join(HOME, ".coldstore", "skills"),
+    os.path.join(HOME, ".coldstore", "tasks"), os.path.join(HOME, "skills-core-baks"),
+    "*skills-core-migration-backup*",
+]
+
+
+def _is_nonworkspace_handoff(path, home=None):
+    """Pure predicate for regression tests; keep in sync with handoff_lint.py."""
+    home = os.path.normpath(home or HOME)
+    path = os.path.normpath(path)
+    roots = (
+        os.path.join(home, ".coldstore", ".claude", "worktrees"),
+        os.path.join(home, ".coldstore", "logs"),
+        os.path.join(home, ".coldstore", "state"),
+        os.path.join(home, ".coldstore", "scripts"),
+        os.path.join(home, ".coldstore", "dispatch", "results"),
+        os.path.join(home, ".coldstore", "archive"),
+        os.path.join(home, ".coldstore", "tmp"),
+        os.path.join(home, ".agent-agent-g"),
+        os.path.join(home, ".agent-agent-e"),
+        os.path.join(home, ".agent-shared"),
+        os.path.join(home, ".coldstore", "etc"),
+        os.path.join(home, ".npm-global"),
+        os.path.join(home, "bin"),
+        os.path.join(home, "snap"),
+        os.path.join(home, "agent-g-sub"),
+        os.path.join(home, "engine-a", "engine-a-core"),
+        os.path.join(home, "research-runtime"),
+        os.path.join(home, "task-dir-a"),
+        os.path.join(home, "示例配音目录"),
+        os.path.join(home, ".codex"),
+        os.path.join(home, ".coldstore", "_deleted"),
+        os.path.join(home, ".coldstore", "cron"),
+        os.path.join(home, ".coldstore", "plugins"),
+        os.path.join(home, ".coldstore", "profiles"),
+        os.path.join(home, ".coldstore", "skills"),
+        os.path.join(home, ".coldstore", "tasks"),
+        os.path.join(home, "skills-core-baks"),
+    )
+    exact = (os.path.join(home, "agent-j"), os.path.join(home, "agent-h"))
+    rel_parts = os.path.relpath(path, home).split(os.sep)
+    venv_like = any(
+        part == "venv" or part.startswith(".venv")
+        or part.endswith(("-venv", "_venv"))
+        for part in rel_parts
+    )
+    return (_is_snapshot_workspace(path) or venv_like or path in exact
+            or any(path == root or path.startswith(root + os.sep) for root in roots))
+
+
+def _is_snapshot_workspace(path):
+    """Reuse lint's ancestor rule; copies never become live routing targets.
+
+    Pure path check also applies to remote/cached records without remote reads.
+    The backup manager itself remains a valid workspace.
+    """
+    from handoff_lint import SNAPSHOT_DIR_RE
+    root = os.path.normpath(path)
+    if os.path.basename(root) == 'HANDOFF.md':
+        root = os.path.dirname(root)
+    return any(SNAPSHOT_DIR_RE.search(part)
+               for part in os.path.dirname(root).split(os.sep))
+
+
+def _find_prune_expr():
+    parts = ["-name %s" % shlex.quote(n) for n in PRUNE_NAMES]
+    parts += ["-path %s" % shlex.quote(p) for p in PRUNE_PATHS]
+    return " -o ".join(parts)
+
+
+FIND_CMD = 'find "$HOME" \\( %s \\) -prune -o -iname HANDOFF.md -print 2>/dev/null' % _find_prune_expr()
+LOCAL_FIND_TIMEOUT = 150
+REMOTE_FIND_TIMEOUT = 150
+
+# ---------- 四大块识别(与 handoff_lint.py 保持一致口径:关键词匹配,不认死模板标题) ----------
+BLOCKS = {
+    "当前态": re.compile(r"^#{1,4}\s*[①②③④⑤0-9.、\s]*(当前态|current\s+state\b)", re.I),
+    "必用skill": re.compile(r"^#{1,4}\s*[①②③④⑤0-9.、\s]*(必用\s*skill|skill\s*索引|必用技能|required\s+skills\b)", re.I),
+    "权限链": re.compile(r"^#{1,4}\s*[①②③④⑤0-9.、\s]*(权限链|授权链|permissions\b)", re.I),
+    "修改日志": re.compile(r"^#{1,4}\s*[①②③④⑤0-9.、\s]*(修改日志|变更日志|改动日志|modification\s+log\b)", re.I),
+}
+
+FIELD_RE = re.compile(r"^-+\s*\**([^*:：()]{1,20}?)\**(?:\s*\([^)]*\))?\s*[:：]\s*(.*)$")
+SKILL_RE = re.compile(r"^-+\s*(⭐|★)?\s*`?([A-Za-z0-9_.\-一-鿿]+)`?\s*[—\-–]*\s*(.*)$")
+STATE_UPDATE_RE = {
+    field: re.compile(r"^(\s*-\s*(?:\*\*)?%s(?:\*\*)?(?:\s*\([^)]*\))?\s*[:：]\s*)(.*)$"
+                      % re.escape(field))
+    for field in ("这是什么", "做到哪", "下一道门", "卡点")
+}
+RECENT_TASK_RE = re.compile(r"^\s*-\s*最近任务\s*[:：]")
+DEP_LINE_RE = re.compile(r"^(\s*-\s*(?:\*\*)?依赖(?:\*\*)?\s*[:：]\s*)(.*)$")
+
+TEMPLATE = """# HANDOFF — {name}
+> 本工作区唯一接手通稿。接手先读,修改必记。规范见 skill `workspace-handoff`。
+
+## 当前态(可覆写,保持最新)
+- 这是什么:{what}
+- 产线(memory-service line,无则填 无):{line}
+- 做到哪:
+- 下一道门:
+- 卡点:
+
+## 必用 skill(去重合并;⭐=验收标准,删除需用户授权)
+- ⭐ `workspace-handoff` — 本文件维护规范,规范见此 skill
+
+## 权限链(只追加)
+- {ts} | {chain} | ws new 建区(工作区索引机制,<date>) | 单次
+
+## 修改日志(只追加,新条目在最下)
+- {ts} | {chain} | 初始化 HANDOFF.md(ws new) | 建区
+"""
+
+
+def default_chain():
+    if os.environ.get("WS_SELFTEST") == "1":
+        return "selftest-ws"
+    origin = os.environ.get("HD_ORIGIN_BOT")
+    if origin:
+        return "%s-ws" % origin
+    return "系统-ws工具"
+
+
+# ============================================================================
+# 采集
+# ============================================================================
+
+def _block_ranges(lines):
+    idx = {}
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        for name, rx in BLOCKS.items():
+            if name not in idx and rx.match(s):
+                idx[name] = i
+    return idx
+
+
+def parse_handoff_text(text):
+    from shared_context_policy import public_text
+    lines = public_text(text).splitlines()
+    idx = _block_ranges(lines)
+
+    def block(name):
+        if name not in idx:
+            return []
+        start = idx[name] + 1
+        later = sorted(v for v in idx.values() if v > idx[name])
+        end = later[0] if later else len(lines)
+        return lines[start:end]
+
+    cur_lines = block("当前态")
+    skill_lines = block("必用skill")
+
+    fields = {"what": "", "line": "", "progress": "", "next_gate": "", "blocker": "",
+              "domain": ""}
+    dependencies = []
+    for ln in cur_lines:
+        m = FIELD_RE.match(ln.strip())
+        if not m:
+            continue
+        key, val = m.group(1), m.group(2).strip()
+        if "这是什么" in key:
+            fields["what"] = val
+        elif "产线" in key:
+            fields["line"] = val
+        elif "做到哪" in key:
+            fields["progress"] = val
+        elif "下一道门" in key:
+            fields["next_gate"] = val
+        elif "卡点" in key:
+            fields["blocker"] = val
+        elif "领域" in key:
+            fields["domain"] = val
+        mdep = DEP_LINE_RE.match(ln)
+        if mdep:
+            dependencies.extend(os.path.normpath(os.path.expanduser(x.strip()))
+                                for x in re.split(r"[,，]", mdep.group(2)) if x.strip())
+
+    skills = []
+    for ln in skill_lines:
+        s = ln.strip()
+        if not s.startswith("-"):
+            continue
+        m = SKILL_RE.match(s)
+        if not m:
+            continue
+        name = m.group(2)
+        if not name:
+            continue
+        skills.append({"name": name, "star": bool(m.group(1)), "note": m.group(3).strip()})
+
+    return {
+        "fields": fields, "skills": skills,
+        "dependencies": sorted(set(dependencies)),
+        "recent_task": parse_recent_task(cur_lines),
+        "current_state_raw": "\n".join(cur_lines).strip(),
+        "skills_raw": "\n".join(skill_lines).strip(),
+    }
+
+
+def parse_recent_task(lines):
+    for line in lines:
+        if not RECENT_TASK_RE.match(line):
+            continue
+        chunks = re.split(r"[:：]", line, maxsplit=1)[1].strip().split("|")
+        if len(chunks) < 4:
+            return None
+        values = {}
+        for chunk in chunks[2:]:
+            pair = re.split(r"[:：]", chunk.strip(), maxsplit=1)
+            if len(pair) == 2:
+                values[pair[0].strip()] = pair[1].strip()
+        if not values.get("做到哪") or not values.get("下一道门"):
+            return None
+        return {"ts": chunks[0].strip(), "chain": chunks[1].strip(),
+                "progress": values["做到哪"], "next_gate": values["下一道门"],
+                "blocker": values.get("卡点")}
+    return None
+
+
+def recent_task_text(record):
+    recent = record.get("recent_task") or {}
+    return " | ".join(str(recent.get(field) or "") for field in
+                      ("ts", "chain", "progress", "next_gate", "blocker")) if recent else ""
+
+
+def build_record_from_text(handoff_path, text, mtime, host, evidence="HANDOFF.md 存在"):
+    parsed = parse_handoff_text(text)
+    ws_dir = os.path.dirname(handoff_path.rstrip("/"))
+    rec = {
+        "path": ws_dir, "handoff_path": handoff_path, "host": host,
+        "name": os.path.basename(ws_dir.rstrip("/")) or ws_dir,
+        "has_handoff": True,
+        "mtime": mtime,
+        "dispatch_refs": 0, "dispatch_labels": [],
+        "priority": None, "evidence": evidence, "verified": True,
+    }
+    rec.update(parsed["fields"])
+    rec["skills"] = parsed["skills"]
+    rec["dependencies"] = parsed["dependencies"]
+    rec["recent_task"] = parsed["recent_task"]
+    return rec
+
+
+def build_record_from_file(handoff_path, host):
+    try:
+        text = open(handoff_path, encoding="utf-8", errors="replace").read()
+        mtime = os.path.getmtime(handoff_path)
+    except OSError:
+        text, mtime = "", 0
+    return build_record_from_text(handoff_path, text, mtime, host)
+
+
+def make_bare_record(path, host, evidence, priority="P1", dispatch_refs=0,
+                      dispatch_labels=None, verified=True):
+    return {
+        "path": path, "handoff_path": None, "host": host,
+        "name": os.path.basename(path.rstrip("/")) or path,
+        "has_handoff": False,
+        "what": "", "line": "", "progress": "", "next_gate": "", "blocker": "",
+        "domain": "", "dependencies": [],
+        "skills": [], "mtime": None,
+        "dispatch_refs": dispatch_refs, "dispatch_labels": dispatch_labels or [],
+        "priority": priority, "evidence": evidence, "verified": verified,
+    }
+
+
+def load_function_foundry():
+    for path in FUNCTION_FOUNDRY_INDEX_PATHS:
+        rows = []
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        rows.append(json.loads(line))
+            return rows
+        except (OSError, json.JSONDecodeError):
+            continue
+    return []
+
+
+def load_function_storage():
+    for path in FUNCTION_FOUNDRY_STORAGE_PATHS:
+        try:
+            value = json.load(open(path, encoding="utf-8"))
+            if value.get("schema_version") == 1:
+                return value.get("storage", [])
+        except (OSError, json.JSONDecodeError, AttributeError):
+            continue
+    return []
+
+
+def _capability_fts_units(query):
+    units = []
+    for chunk in re.findall(r"[a-z0-9_.+-]{3,}|[\u3400-\u9fff]{3,}", query.casefold()):
+        if re.fullmatch(r"[\u3400-\u9fff]+", chunk):
+            units.extend(chunk[i:i + 3] for i in range(max(1, len(chunk) - 2)))
+        else:
+            units.append(chunk)
+    return list(dict.fromkeys(units))[:48]
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _local_capability_fts_search(query, limit=10):
+    units = _capability_fts_units(query)
+    if not units:
+        return None
+    match = " OR ".join('"%s"' % x.replace('"', '""') for x in units)
+    for path in CAPABILITY_INDEX_PATHS:
+        if not os.path.isfile(path):
+            continue
+        try:
+            uri = "file:%s?mode=ro" % path
+            with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=2)) as conn:
+                conn.row_factory = sqlite3.Row
+                meta = {r[0]: json.loads(r[1]) for r in
+                        conn.execute("SELECT key,value_json FROM meta")}
+                manifest_path = os.path.join(
+                    os.path.dirname(path), CAPABILITY_ROUTER_MANIFEST_NAME
+                )
+                with open(manifest_path, encoding="utf-8") as manifest_handle:
+                    manifest = json.load(manifest_handle)
+                if (manifest.get("engine") != CAPABILITY_ROUTER_ENGINE
+                        or manifest.get("package_version") !=
+                        CAPABILITY_ROUTER_PACKAGE_VERSION
+                        or manifest.get("source_commit") !=
+                        CAPABILITY_ROUTER_SOURCE_COMMIT
+                        or manifest.get("wheel_sha256") !=
+                        CAPABILITY_ROUTER_WHEEL_SHA256
+                        or manifest.get("litellm_security_floor") !=
+                        CAPABILITY_ROUTER_LITELLM_FLOOR
+                        or manifest.get("litellm_locked_version") !=
+                        CAPABILITY_ROUTER_LITELLM_VERSION
+                        or manifest.get("offline_cost_map_enforced") is not True
+                        or float(manifest.get("score_threshold") or -1) !=
+                        CAPABILITY_ROUTER_SCORE_THRESHOLD
+                        or manifest.get("aggregation") !=
+                        CAPABILITY_ROUTER_AGGREGATION
+                        or int(manifest.get("retrieval_contract_version") or 0) !=
+                        CAPABILITY_RETRIEVAL_CONTRACT_VERSION
+                        or meta.get("router_engine") != CAPABILITY_ROUTER_ENGINE
+                        or meta.get("router_package_version") !=
+                        CAPABILITY_ROUTER_PACKAGE_VERSION
+                        or manifest.get("cards_sha256") != meta.get("cards_sha256")
+                        or int(manifest.get("card_count") or 0) !=
+                        int(meta.get("card_count") or 0)
+                        or manifest.get("utterances_sha256") !=
+                        meta.get("router_utterances_sha256")
+                        or int(manifest.get("utterance_count") or 0) !=
+                        int(meta.get("router_utterance_count") or 0)
+                        or manifest.get("cpu_only_enforced") is not True
+                        or meta.get("embedding_device") != "cpu"
+                        or int(meta.get("embedding_vram_mib") or 0) != 0
+                        or manifest.get("index_sha256") != _file_sha256(path)):
+                    continue
+                rows = conn.execute(
+                    "SELECT c.card_json,bm25(capability_fts) AS fts_score "
+                    "FROM capability_fts JOIN capabilities AS c "
+                    "ON c.rowid=capability_fts.rowid "
+                    "WHERE capability_fts MATCH ? ORDER BY fts_score LIMIT ?",
+                    (match, int(limit)),
+                ).fetchall()
+            matches = []
+            for rank, row in enumerate(rows, 1):
+                card = json.loads(row["card_json"])
+                matches.append({
+                    "card_id": card["card_id"], "tool_id": card["tool_id"],
+                    "capability_id": card["capability_id"], "title": card["title"],
+                    "intent": card["intent"], "aliases": card["aliases"],
+                    "scenarios": card["scenarios"],
+                    "anti_scenarios": card["anti_scenarios"],
+                    "callable": card["callable"], "status": card["status"],
+                    "tier": card["tier"], "entrypoints": card["entrypoints"],
+                    "workspace_paths": card["workspace_paths"],
+                    "evidence": card["evidence"], "fts_rank": rank,
+                    "fts_bm25": float(row["fts_score"]),
+                })
+            return {"ok": True, "mode": "fts-fallback",
+                    "engine": CAPABILITY_ROUTER_ENGINE,
+                    "package_version": CAPABILITY_ROUTER_PACKAGE_VERSION,
+                    "semantic_status": "remote_unavailable_local_fts",
+                    "embedding_model": meta.get("embedding_model"),
+                    "embedding_device": meta.get("embedding_device"),
+                    "matches": matches, "source": path}
+        except (OSError, sqlite3.Error, json.JSONDecodeError, KeyError, TypeError):
+            continue
+    return None
+
+
+def capability_search(query, limit=10):
+    argv = [CAPABILITY_REMOTE_SCRIPT, "--search", query, "--mode", "semantic-router",
+            "--limit", str(int(limit)), "--index", CAPABILITY_REMOTE_INDEX]
+    try:
+        if HOST == "mac":
+            remote = " ".join(shlex.quote(x) for x in argv)
+            proc = subprocess.run(
+                ["ssh", "-o", "ConnectTimeout=2", "-o", "BatchMode=yes",
+                 "user@host-b", remote],
+                text=True, capture_output=True, timeout=CAPABILITY_QUERY_TIMEOUT_SEC,
+            )
+        else:
+            proc = subprocess.run(
+                argv, text=True, capture_output=True,
+                timeout=CAPABILITY_QUERY_TIMEOUT_SEC,
+            )
+        if proc.returncode == 0:
+            value = json.loads(proc.stdout)
+            if value.get("ok") is True and isinstance(value.get("matches"), list):
+                value["source"] = "hostb_semantic_router"
+                return value
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, TypeError):
+        pass
+    return _local_capability_fts_search(query, limit)
+
+
+def local_handoff_paths():
+    """返回 None 表示本次 find 失败/超时(磁盘忙等),调用方应回退用旧缓存兜底,
+    绝不能把 None 当"真的一个 HANDOFF.md 都没有"处理,否则整机记录会被冲空。"""
+    try:
+        r = subprocess.run(["bash", "-c", FIND_CMD], capture_output=True, text=True,
+                           timeout=LOCAL_FIND_TIMEOUT)
+        return [l for l in r.stdout.splitlines()
+                if l.strip() and not _is_nonworkspace_handoff(l)]
+    except Exception as e:
+        print("警告: 本机 find HANDOFF.md 失败/超时(%s),本次索引本机部分回退用旧缓存" % e,
+              file=sys.stderr)
+        return None
+
+
+def _parse_remote_dump(out):
+    entries = []
+    for b in out.split("===WS_FILE===\n")[1:]:
+        try:
+            path_part, rest = b.split("===WS_MTIME===\n", 1)
+            mtime_part, rest2 = rest.split("===WS_BODY===\n", 1)
+            body = rest2.split("===WS_END===", 1)[0]
+            path = path_part.strip()
+            mtime = float((mtime_part.strip() or "0").splitlines()[0] or 0)
+            entries.append((path, body, mtime))
+        except Exception:
+            continue
+    return entries
+
+
+def _filter_remote_entries(entries, peer_home):
+    """远端 find 命令含本机展开的绝对剪枝路径，回传后必须按远端 HOME 再过滤。"""
+    return [entry for entry in entries
+            if not _is_nonworkspace_handoff(entry[0], home=peer_home)]
+
+
+def remote_handoff_dump():
+    """返回 [(handoff_path, content, mtime), ...] 或 None(对侧不可达,降级)。"""
+    remote_script = (
+        FIND_CMD + ' | while IFS= read -r f; do '
+        'echo "===WS_FILE==="; echo "$f"; '
+        'echo "===WS_MTIME==="; (stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null); '
+        'echo "===WS_BODY==="; cat "$f"; echo "===WS_END==="; done'
+    )
+    try:
+        r = subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=6", "-o", "BatchMode=yes", PEER_SSH,
+             "bash -lc %s" % shlex.quote(remote_script)],
+            capture_output=True, text=True, timeout=REMOTE_FIND_TIMEOUT)
+    except Exception:
+        return None
+    if r.returncode != 0 and not r.stdout.strip():
+        return None
+    return _filter_remote_entries(_parse_remote_dump(r.stdout), PEER_HOME)
+
+
+def fetch_remote_file(path):
+    try:
+        r = subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=6", "-o", "BatchMode=yes", PEER_SSH,
+             "cat %s" % shlex.quote(path)],
+            capture_output=True, text=True, timeout=15)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout
+
+
+def lint_missing_local():
+    try:
+        r = subprocess.run(["python3", LINT_PATH, "--json"], capture_output=True,
+                           text=True, timeout=90)
+        data = json.loads(r.stdout)
+        return data.get("missing", [])
+    except Exception:
+        return []
+
+
+def dispatch_refs():
+    """path -> {count, labels, tasks},来源同 handoff_lint.py 的判据③。
+
+    count 按不同派单计,不按同一 prompt 里的出现次数计。tasks 保留任务身份,
+    后面把多个“文件/产物路径”归并到同一工作区根时用集合去重,避免一单里
+    列了 20 个 results.json 就被误算成“20 个不同派单引用”。
+    """
+    counts = {}
+    pat = re.compile(r"(?:/Users/[A-Za-z0-9_.-]+|/home/[A-Za-z0-9_.-]+|~)"
+                     r"/[A-Za-z0-9_.一-鿿-]+(?:/[A-Za-z0-9_.一-鿿-]+)*")
+    for state in ("done", "failed"):
+        d = os.path.join(DISPATCH, state)
+        if not os.path.isdir(d):
+            continue
+        try:
+            tids = os.listdir(d)
+        except OSError:
+            continue
+        for tid in tids:
+            p = os.path.join(d, tid, "prompt.md")
+            if not os.path.isfile(p):
+                continue
+            try:
+                txt = open(p, encoding="utf-8", errors="ignore").read()
+            except OSError:
+                continue
+            label = ""
+            tj = os.path.join(d, tid, "task.json")
+            if os.path.isfile(tj):
+                try:
+                    label = json.load(open(tj)).get("label", "")
+                except Exception:
+                    pass
+            seen = set()
+            for m in pat.findall(txt):
+                if m.startswith("~"):
+                    m = HOME + m[1:]
+                seen.add(m)
+            for m in seen:
+                rec = counts.setdefault(m, {"count": 0, "labels": set(), "tasks": set()})
+                rec["tasks"].add("%s/%s" % (state, tid))
+                rec["count"] = len(rec["tasks"])
+                if label:
+                    rec["labels"].add(label)
+    return counts
+
+
+# dispatch prompt 里的路径是“任务证据”,不是“工作区声明”。历史实测中
+# results.json / report.md / .venv/bin/python / *.pt 因被 >=2 单引用,全部被提升为
+# 裸候选工作区。下面只做“归属”:
+#   1) 最深的已知 HANDOFF/lint 工作区根;
+#   2) 本机确有项目标记的仓库根(用于发现尚未建 HANDOFF 的新项目)。
+# 绝不把文件、runs/models/data 子目录或对侧未核实路径单独晋升。
+PROJECT_MARKERS = (
+    ".git", "pyproject.toml", "package.json", "pubspec.yaml", "Cargo.toml",
+    "go.mod", "setup.py", "setup.cfg", "AGENTS.md",
+)
+
+
+def _dispatch_path_host(path):
+    if path.startswith("/Users/"):
+        return "mac"
+    if path.startswith("/home/"):
+        return "hostb"
+    return HOST
+
+
+def _deepest_workspace_root(path, host, records):
+    roots = sorted((r["path"].rstrip("/") for r in records
+                    if r.get("host") == host and r.get("path")), key=len, reverse=True)
+    for root in roots:
+        if path == root or path.startswith(root + "/"):
+            return root
+    return None
+
+
+def _local_project_root(path, home=None):
+    """Conservative local-only promotion: return a real marked project root or None.
+
+    `home` is injectable solely for the isolated selftest. Production always uses HOME.
+    Hidden/system roots are never discovered from prompt text; if they are real workspaces,
+    an existing HANDOFF/lint record remains authoritative.
+    """
+    home = os.path.abspath(home or HOME).rstrip("/")
+    path = os.path.abspath(path)
+    if not (path == home or path.startswith(home + "/")):
+        return None
+    rel = path[len(home):].lstrip("/")
+    if not rel:
+        return None
+    # 项目标记只证明“是代码仓库”，不证明“是长期协作工作区”。已知的上游依赖、
+    # 运行态和退役根必须先经过同一排除谓词，否则 prompt 引用两次就会重新晋升。
+    if _is_nonworkspace_handoff(path, home=home):
+        return None
+    first = rel.split("/", 1)[0]
+    if first.startswith(".") or first in PRUNE_NAMES:
+        return None
+
+    probe = path if os.path.isdir(path) else os.path.dirname(path)
+    # 旧 prompt 可能指向已移走的产物;只向上找仍存在的项目根,不会重建/删除任何东西。
+    while probe.startswith(home + "/"):
+        if os.path.isdir(probe) and any(os.path.exists(os.path.join(probe, m))
+                                        for m in PROJECT_MARKERS):
+            return probe
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    return None
+
+
+def _aggregate_dispatch_targets(refs, records, local_home=None):
+    """Canonical target -> distinct tasks/labels, plus diagnostics; pure except local stat."""
+    grouped = {}
+    unresolved = 0
+    attributed_raw = 0
+    for path, info in refs.items():
+        host = _dispatch_path_host(path)
+        root = _deepest_workspace_root(path, host, records)
+        if root is None and host == HOST:
+            root = _local_project_root(path, home=local_home)
+        if root is None:
+            unresolved += 1
+            continue
+        attributed_raw += 1
+        key = (host, root)
+        g = grouped.setdefault(key, {"tasks": set(), "labels": set(), "raw_paths": set()})
+        g["tasks"].update(info.get("tasks") or ())
+        # 兼容旧/测试调用者只给 count 的形态;生产 dispatch_refs 总有 tasks。
+        if not info.get("tasks"):
+            g["tasks"].update("legacy:%s:%d" % (path, i)
+                              for i in range(int(info.get("count", 0))))
+        g["labels"].update(info.get("labels") or ())
+        g["raw_paths"].add(path)
+    return grouped, {
+        "raw_paths": len(refs),
+        "attributed_raw_paths": attributed_raw,
+        "unresolved_raw_paths": unresolved,
+        "canonical_targets": len(grouped),
+    }
+
+
+def _prior_cache_records():
+    try:
+        return json.load(open(CACHE_FILE, encoding="utf-8")).get("records", {})
+    except Exception:
+        return {}
+
+
+def build_index(force=True):
+    now = time.time()
+    local_paths = local_handoff_paths()
+    local_records = {}
+    if local_paths is None:
+        # 本机 find 超时/失败:回退用上一次缓存里本机的记录兜底,不清空。
+        for k, v in _prior_cache_records().items():
+            if v.get("host") == HOST:
+                h, p = k.split("|", 1)
+                local_records[(h, p)] = v
+    else:
+        for hp in local_paths:
+            rec = build_record_from_file(hp, HOST)
+            local_records[(HOST, rec["path"])] = rec
+
+    remote_records = {}
+    dump = remote_handoff_dump()
+    remote_ok = dump is not None
+    if dump is not None:
+        for hp, content, mtime in dump:
+            rec = build_record_from_text(hp, content, mtime, PEER_HOST)
+            remote_records[(PEER_HOST, rec["path"])] = rec
+    else:
+        # 对侧不可达/超时:回退用上一次缓存里对侧的记录兜底,标记为可能过期,不清空。
+        for k, v in _prior_cache_records().items():
+            if v.get("host") == PEER_HOST:
+                h, p = k.split("|", 1)
+                remote_records[(h, p)] = v
+
+    for m in lint_missing_local():
+        key = (HOST, m["path"])
+        if key not in local_records:
+            local_records[key] = make_bare_record(
+                m["path"], HOST, evidence=m.get("evidence", ""),
+                priority=m.get("priority", "P1"))
+
+    refs = dispatch_refs()
+    all_current = list(local_records.values()) + list(remote_records.values())
+    grouped_refs, dispatch_stats = _aggregate_dispatch_targets(refs, all_current)
+    promoted = 0
+    for (host, root), info in grouped_refs.items():
+        nrefs = len(info["tasks"])
+        if nrefs < 2:
+            continue
+        key = (host, root)
+        target = local_records if host == HOST else remote_records
+        if key in target:
+            target[key]["dispatch_refs"] = max(target[key].get("dispatch_refs", 0), nrefs)
+            target[key]["dispatch_labels"] = sorted(
+                set(target[key].get("dispatch_labels", [])) | info["labels"])
+        elif host == HOST:
+            # _aggregate_dispatch_targets 只会把“本机存在且带项目标记”
+            # 的根交到这里;文件/产物目录/对侧未验路径根本进不来。
+            local_records[key] = make_bare_record(
+                root, host, evidence="dispatch任务归属x%d(已验项目根)" % nrefs,
+                dispatch_refs=nrefs, dispatch_labels=sorted(info["labels"]))
+            promoted += 1
+
+    dispatch_stats["promoted_bare_roots"] = promoted
+
+    # Function Foundry has deliberate storage tiers rather than one HANDOFF in
+    # every CAS/quarantine directory.  Its signed exporter is the directory
+    # authority; expose those roots as graph/page nodes without inventing prose.
+    for item in load_function_storage():
+        host, path = item.get("host"), item.get("path")
+        if host not in (HOST, PEER_HOST) or not path:
+            continue
+        target = local_records if host == HOST else remote_records
+        rec = make_bare_record(path, host,
+                               evidence="Function Foundry %s exporter" % item.get("tier"))
+        rec.update({"what": item.get("description", "Function Foundry storage"),
+                    "domain": "Agent基础设施", "pipeline": "Function Foundry",
+                    "domain_source": "declared", "mtime": item.get("mtime")})
+        target[(host, path)] = rec
+
+    records = {}
+    for (h, p), v in list(local_records.items()) + list(remote_records.items()):
+        records["%s|%s" % (h, p)] = v
+
+    assets = pager.load_assets()
+    cache = {"schema_version": INDEX_SCHEMA_VERSION,
+             "built_at": now, "host": HOST, "remote_reachable": remote_ok,
+             "dispatch_path_stats": dispatch_stats, "records": records,
+             "assets": assets}
+    cache = public_index(cache)
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = CACHE_FILE + ".tmp.%d" % os.getpid()
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, CACHE_FILE)
+    try:
+        pager.WorkspacePager().sync(records, assets, HOST)
+    except Exception as exc:
+        # The deterministic directory remains usable if the page database is
+        # temporarily locked; page commands themselves fail closed.
+        print("警告:页表同步失败:%s" % exc, file=sys.stderr)
+    return cache
+
+
+def _cache_status(cache):
+    now = time.time()
+    built_at = float(cache.get("built_at") or 0)
+    try:
+        file_mtime = float(os.path.getmtime(CACHE_FILE))
+    except OSError:
+        file_mtime = 0.0
+    invalidated = file_mtime <= 1.0
+    built_age = max(0.0, now - built_at)
+    file_age = max(0.0, now - file_mtime) if not invalidated else built_age
+    age_sec = max(built_age, file_age)
+    return {
+        "stale": invalidated or age_sec >= CACHE_TTL_SEC,
+        "invalidated": invalidated,
+        "age_sec": round(age_sec, 3),
+        "ttl_sec": CACHE_TTL_SEC,
+        "served_last_valid": True,
+        "refresh_command": "ws index --rebuild",
+    }
+
+
+def _valid_index_cache(cache):
+    return (
+        isinstance(cache, dict)
+        and cache.get("schema_version") == INDEX_SCHEMA_VERSION
+        and isinstance(cache.get("graph"), dict)
+        and isinstance(cache.get("records"), dict)
+        and isinstance(cache.get("assets", []), list)
+        and isinstance(cache.get("built_at"), (int, float))
+        and not isinstance(cache.get("built_at"), bool)
+    )
+
+
+def public_index(cache):
+    from shared_context_policy import blocked_context, public_text
+    def clean(value):
+        if isinstance(value, str):
+            return public_text(value)
+        if isinstance(value, dict):
+            return {key: clean(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [clean(item) for item in value]
+        return value
+    result = clean(cache)
+    result['records'] = {key: clean(record) for key, record in cache['records'].items()
+                         if not blocked_context(key, record.get('path'))
+                         and not _is_snapshot_workspace(record.get('path') or key)}
+    result['assets'] = [clean(asset) for asset in cache.get('assets', [])
+                        if not blocked_context(asset.get('asset_id'), asset.get('original_path'))]
+    result['graph'] = build_workspace_graph(result['records'], result['assets'])
+    return result
+
+
+def load_index():
+    """Return the last valid cache immediately; never rebuild from a query."""
+    try:
+        with open(CACHE_FILE, encoding="utf-8") as handle:
+            cache = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise pager.PagerRefused(
+            "REFUSE_WORKSPACE_INDEX_UNAVAILABLE run='ws index --rebuild' error=%s" % exc
+        )
+    if not _valid_index_cache(cache):
+        raise pager.PagerRefused(
+            "REFUSE_WORKSPACE_INDEX_INVALID run='ws index --rebuild'"
+        )
+    cache = dict(cache)
+    cache.setdefault("assets", [])
+    cache["cache_status"] = _cache_status(cache)
+    return public_index(cache)
+
+
+def _report_cache_status(cache):
+    status = cache.get("cache_status") or _cache_status(cache)
+    if status.get("stale"):
+        print(
+            "CACHE_STALE age_sec=%s serving=last_valid refresh='ws index --rebuild'"
+            % status.get("age_sec"), file=sys.stderr,
+        )
+
+
+def _invalidate_index(changed_path):
+    """写后只把缓存标 stale；显式维护重建前查询继续读最后合法版本。"""
+    try:
+        real = os.path.realpath(changed_path)
+        if real.startswith(("/tmp/", "/private/tmp/")) or not os.path.exists(CACHE_FILE):
+            return
+        os.utime(CACHE_FILE, (0, 0))
+    except OSError:
+        pass                         # 缓存失效失败不应让权威 HANDOFF 写入失败
+
+
+# ============================================================================
+# Workspace Graph —— memory-service 的确定性目录平面。
+# 显式 `领域:` 字段永远优先；旧通稿没有该字段时只做可解释推断，并把 source=inferred
+# 写进索引，绝不把启发式分类冒充人工事实。无法可靠判断的归「未分类」。
+# ============================================================================
+DOMAIN_RULES = (
+    ("冷资产", ("冷资产", "cold_asset", "cold-asset", "archive", "vault", "百度云", "baidu")),
+    ("示例项目", ("示例项目", "project-a", "示例产线", "示例题库", "示例关键词A", "示例关键词B", "示例关键词C")),
+    ("科研", ("agent-g", "dreamer", "research", "论文", "实验", "偏置", "sae", "interpretability",
+             "safe-control", "research")),
+    ("Agent基础设施", ("/.coldstore", "memory-service", "dispatch", "agent", "bot", "skill", "harness", "pai")),
+)
+
+
+def _infer_domain(rec):
+    explicit = (rec.get("domain") or "").strip()
+    if explicit and explicit not in ("无", "未分类"):
+        return explicit, "explicit"
+    hay = " ".join(str(rec.get(k) or "") for k in
+                   ("path", "name", "what", "line")).lower()
+    for domain, needles in DOMAIN_RULES:
+        if any(n.lower() in hay for n in needles):
+            return domain, "inferred"
+    return "未分类", "unclassified"
+
+
+def _pipeline_name(rec):
+    line = re.sub(r"\s+", " ", (rec.get("line") or "").strip())
+    return line if line and line != "无" else "无产线"
+
+
+def build_workspace_graph(records, assets=None):
+    assets = assets or []
+    domains = {}
+    edges = []
+    for key, rec in records.items():
+        domain, source = _infer_domain(rec)
+        pipeline = _pipeline_name(rec)
+        rec["domain"] = domain
+        rec["domain_source"] = source
+        rec["pipeline"] = pipeline
+        d = domains.setdefault(domain, {"count": 0, "explicit": 0, "inferred": 0,
+                                        "unclassified": 0, "pipelines": {}})
+        d["count"] += 1
+        d[source] += 1
+        p = d["pipelines"].setdefault(pipeline, {"count": 0, "workspaces": []})
+        p["count"] += 1
+        p["workspaces"].append(key)
+        for dep in rec.get("dependencies") or []:
+            edges.append({"from": key, "to_path": dep, "type": "depends_on"})
+    # Asset ownership is deterministic: same host + deepest workspace path
+    # containing the asset's original path.  Unowned assets remain searchable
+    # at graph level instead of being silently dropped.
+    for asset in assets:
+        original = str(asset.get("original_path") or "").rstrip("/")
+        host = asset.get("host")
+        candidates = [
+            (key, rec) for key, rec in records.items()
+            if rec.get("host") == host and rec.get("path")
+            and (original == rec["path"].rstrip("/")
+                 or original.startswith(rec["path"].rstrip("/") + "/"))
+        ]
+        if candidates:
+            owner, _ = max(candidates, key=lambda x: len(x[1]["path"]))
+            edges.append({"from": owner, "to_asset": asset.get("asset_id"),
+                          "type": "contains_asset"})
+    for d in domains.values():
+        for p in d["pipelines"].values():
+            p["workspaces"].sort()
+    return {"levels": ["domain", "pipeline", "workspace", "asset"],
+            "domains": domains, "edges": edges,
+            "workspace_count": len(records), "asset_count": len(assets),
+            "edge_count": len(edges)}
+
+
+def refresh_local_record(rec):
+    if rec.get("host") != HOST or not rec.get("handoff_path"):
+        return rec
+    if not os.path.isfile(rec["handoff_path"]):
+        return rec
+    fresh = build_record_from_file(rec["handoff_path"], HOST)
+    fresh["dispatch_refs"] = rec.get("dispatch_refs", 0)
+    fresh["dispatch_labels"] = rec.get("dispatch_labels", [])
+    return fresh
+
+
+# ============================================================================
+# 原子追加(独立锁文件,详见文件头注释——不能靠 rename 后的旧 fd 当锁句柄)
+# ============================================================================
+
+def _locked_rewrite(hp, mutate_fn):
+    """mutate_fn(lines:list[str]) -> list[str] | None(None=不写,已处理如"已存在跳过")。
+    返回 (ok, message)。"""
+    if not os.path.isfile(hp):
+        return False, "HANDOFF.md 不存在: %s(先用 ws new 建区)" % hp
+    lockpath = hp + ".lock"
+    lockf = open(lockpath, "a+")
+    try:
+        fcntl.flock(lockf, fcntl.LOCK_EX)
+        text = open(hp, encoding="utf-8").read()
+        lines = text.splitlines()
+        new_lines, msg = mutate_fn(lines)
+        if new_lines is None:
+            return True, msg
+        new_text = "\n".join(new_lines)
+        if not new_text.endswith("\n"):
+            new_text += "\n"
+        tmp = hp + ".tmp.%d" % os.getpid()
+        with open(tmp, "w", encoding="utf-8") as tf:
+            tf.write(new_text)
+        os.replace(tmp, hp)
+        _invalidate_index(hp)
+        # <date>: `ws --selftest` promises 全隔离/绝不碰真缓存, but this hook was
+        # registering every /tmp/ws_selftest_* workspace as a live HOT page in the
+        # production page table (72 rows on Mac, 28 on hostb, dirs long gone).
+        if (os.environ.get("WS_SELFTEST") != "1"
+                and not os.path.dirname(hp).startswith("/tmp/ws_selftest_")):
+            try:
+                pager.WorkspacePager().mark_dirty(HOST, os.path.dirname(hp), "HANDOFF write")
+            except Exception as exc:
+                print("警告:页表标脏失败:%s" % exc, file=sys.stderr)
+        return True, msg
+    finally:
+        try:
+            fcntl.flock(lockf, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        lockf.close()
+
+
+def _append_to_block(lines, block_name, new_line):
+    idx = _block_ranges(lines)
+    if block_name not in idx:
+        raise ValueError("缺块 [%s],无法追加(规范要求四大块齐全)" % block_name)
+    start = idx[block_name]
+    later = sorted(v for v in idx.values() if v > start)
+    end = later[0] if later else len(lines)
+    insert_at = start + 1
+    for j in range(end - 1, start, -1):
+        if lines[j].strip():
+            insert_at = j + 1
+            break
+    return lines[:insert_at] + [new_line] + lines[insert_at:]
+
+
+# ============================================================================
+# 子命令
+# ============================================================================
+
+def _fmt_skill_list(skills):
+    star = [s["name"] for s in skills if s.get("star")]
+    allnames = [s["name"] for s in skills]
+    return star, allnames
+
+
+def print_record(rec, host_note=True):
+    tag = "" if rec["host"] == HOST else " [对侧:%s]" % rec["host"]
+    print("路径: %s%s" % (rec["path"], tag))
+    if not rec.get("has_handoff"):
+        print("  这是什么: (尚无 HANDOFF.md — 候选工作区,证据: %s)" % rec.get("evidence", ""))
+        print("  建议: ws new %s --what \"...\" --line <产线>" % rec["path"])
+        print("")
+        return
+    fresh = refresh_local_record(rec)
+    print("  这是什么: %s" % (fresh.get("what") or "(未填)"))
+    print("  产线: %s" % (fresh.get("line") or "无"))
+    star, allnames = _fmt_skill_list(fresh.get("skills", []))
+    print("  ⭐必用skill: %s" % (", ".join(star) if star else "(无标星)"))
+    print("  全部skill: %s" % (", ".join(allnames) if allnames else "(空)"))
+    print("  当前态: 做到哪=%s | 下一道门=%s | 卡点=%s" % (
+        fresh.get("progress") or "(未填)", fresh.get("next_gate") or "(未填)",
+        fresh.get("blocker") or "(未填)"))
+    if host_note and rec["host"] != HOST:
+        print("  (只读展示,来自索引缓存;如需操作请: ssh %s '~/.coldstore/bin/ws ...')" % PEER_SSH)
+    if fresh.get("recent_task"):
+        print("  最近任务: " + recent_task_text(fresh))
+    print("")
+
+
+def cmd_find(keyword_args):
+    kws = []
+    for a in keyword_args:
+        kws.extend(a.split())
+    kws = [k.lower() for k in kws if k]
+    if not kws:
+        print("用法: ws find <关键词...>")
+        return 2
+    cache = load_index()
+    _report_cache_status(cache)
+    scored = []
+    for rec in cache["records"].values():
+        hay = " ".join([
+            rec.get("path", ""), rec.get("name", ""), rec.get("what", ""),
+            rec.get("line", ""), rec.get("progress", ""), rec.get("next_gate", ""),
+            rec.get("blocker", ""),
+            recent_task_text(rec),
+            " ".join(s.get("name", "") for s in rec.get("skills", [])),
+            " ".join(rec.get("dispatch_labels", [])),
+        ]).lower()
+        hits = sum(1 for k in kws if k in hay)
+        if hits > 0:
+            scored.append((hits, rec))
+    if not scored:
+        print("NO_MATCH")
+        print("没有工作区匹配关键词「%s」。" % " ".join(kws))
+        print("若本任务会产生持久产物,建议建区:")
+        print("  ws new <路径> --what \"这是什么\" --line <产线>")
+        return 0
+    scored.sort(key=lambda x: (-x[0], x[1]["path"]))
+    for hits, rec in scored[:10]:
+        print_record(rec)
+    return 0
+
+
+def cmd_list():
+    cache = load_index()
+    recs = sorted(cache["records"].values(), key=lambda r: (r["host"], r["path"]))
+    for rec in recs:
+        tag = "" if rec["host"] == HOST else "[%s] " % rec["host"]
+        one = rec.get("what") or ("(候选,无HANDOFF: %s)" % rec.get("evidence", "")
+                                  if not rec.get("has_handoff") else "(未填这是什么)")
+        print("%s%s — %s" % (tag, rec["path"], one))
+    return 0
+
+
+def _route_score(rec, keywords):
+    """字段加权的确定性路由；只做字符串匹配，不伪装成语义检索。"""
+    weighted = (("domain", 12), ("pipeline", 10), ("line", 9), ("name", 8),
+                ("path", 7), ("what", 6), ("progress", 3), ("next_gate", 2),
+                ("blocker", 1))
+    score, matched = 0, []
+    for kw in keywords:
+        got = False
+        for field, weight in weighted:
+            if kw in str(rec.get(field) or "").lower():
+                score += weight
+                got = True
+        skill_hay = " ".join(s.get("name", "") for s in rec.get("skills", [])).lower()
+        if kw in skill_hay:
+            score += 5
+            got = True
+        if not got and kw in recent_task_text(rec).lower():
+            score += 1
+            got = True
+        if got:
+            matched.append(kw)
+    # 多词全命中优先，避免只擦中一个泛词的目录霸榜。
+    if keywords and len(matched) == len(keywords):
+        score += 20
+    return score, matched
+
+
+def _route_records(cache, keyword_args, limit=10):
+    kws = []
+    for a in keyword_args:
+        kws.extend(a.lower().split())
+    kws = [k for k in kws if k]
+    scored = []
+    for key, rec in cache.get("records", {}).items():
+        score, matched = _route_score(rec, kws)
+        if score:
+            scored.append((score, key, rec, matched))
+    scored.sort(key=lambda x: (-x[0], x[2].get("domain", ""),
+                               x[2].get("pipeline", ""), x[2].get("path", "")))
+    return scored[:limit]
+
+
+def cmd_map(keyword_args, as_json=False, limit=12):
+    cache = load_index()
+    graph = cache.get("graph") or build_workspace_graph(
+        cache.get("records", {}), cache.get("assets", []))
+    if keyword_args:
+        routed = _route_records(cache, keyword_args, limit=limit)
+        keys = {x[1] for x in routed}
+        domains = {}
+        for key in keys:
+            rec = cache["records"][key]
+            d = domains.setdefault(rec["domain"], {})
+            d[rec["pipeline"]] = d.get(rec["pipeline"], 0) + 1
+    else:
+        domains = {dn: {pn: pv["count"] for pn, pv in dv["pipelines"].items()}
+                   for dn, dv in graph.get("domains", {}).items()}
+    payload = {
+        "schema_version": cache.get("schema_version"),
+        "built_at": cache.get("built_at"),
+        "remote_reachable": cache.get("remote_reachable"),
+        "workspace_count": graph.get("workspace_count", 0),
+        "asset_count": graph.get("asset_count", 0),
+        "dependency_edges": graph.get("edge_count", 0),
+        "domains": domains,
+    }
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    print("Workspace Graph: %d 工作区 / %d 云资产 / %d 图边 / peer=%s" % (
+        payload["workspace_count"], payload["asset_count"], payload["dependency_edges"],
+        "online" if payload["remote_reachable"] else "cached"))
+    for domain in sorted(domains):
+        pipes = sorted(domains[domain].items(), key=lambda x: (-x[1], x[0]))
+        shown = pipes[:limit]
+        print("\n%s (%d)" % (domain, sum(v for _, v in pipes)))
+        for pipeline, count in shown:
+            print("  └─ %s (%d)" % (pipeline, count))
+        if len(pipes) > len(shown):
+            print("  └─ …另 %d 条产线" % (len(pipes) - len(shown)))
+    return 0
+
+
+def cmd_route(keyword_args, as_json=False, limit=10):
+    cache = load_index()
+    if not as_json:
+        _report_cache_status(cache)
+    routed = _route_records(cache, keyword_args, limit=limit)
+    payload = []
+    for score, key, rec, matched in routed:
+        payload.append({
+            "kind": "workspace", "score": score, "matched": matched,
+            "domain": rec.get("domain"),
+            "domain_source": rec.get("domain_source"), "pipeline": rec.get("pipeline"),
+            "host": rec.get("host"), "path": rec.get("path"), "what": rec.get("what"),
+            "dependencies": rec.get("dependencies") or [],
+            "next": "ws show %s" % shlex.quote(rec.get("path", "")),
+        })
+    kws = []
+    for arg in keyword_args:
+        kws.extend(arg.lower().split())
+    for score, asset, matched in pager.asset_search(cache.get("assets", []), kws, limit=limit):
+        payload.append({
+            "kind": "cloud_asset", "score": score, "matched": matched,
+            "asset_id": asset.get("asset_id"), "host": asset.get("host"),
+            "path": asset.get("original_path"), "what": asset.get("description"),
+            "size_bytes": asset.get("size_bytes"),
+            "cloud_verified": asset.get("cloud_verified"),
+            "restore_verified": asset.get("restore_verified"),
+            "next": "ws page enter --asset-id %s" % shlex.quote(asset.get("asset_id", "")),
+        })
+    for tool in load_function_foundry():
+        matched = []
+        score = 0
+        fields = (("tool_id", 18), ("repo", 14), ("description", 6),
+                  ("keywords", 5), ("status", 3))
+        for kw in kws:
+            hit = False
+            for name, weight in fields:
+                value = tool.get(name, "")
+                if isinstance(value, list): value = " ".join(map(str, value))
+                if kw in str(value).casefold(): score += weight; hit = True
+            if hit: matched.append(kw)
+        if kws and len(matched) == len(kws): score += 20
+        if not score: continue
+        if tool.get("callable"): score += 25
+        elif tool.get("status") == "quarantine": score += 5
+        payload.append({"kind": "function_tool", "score": score, "matched": matched,
+                        "tool_id": tool.get("tool_id"), "repo": tool.get("repo"),
+                        "status": tool.get("status"), "tier": tool.get("tier"),
+                        "callable": tool.get("callable"), "commit": tool.get("commit"),
+                        "what": tool.get("description"), "next": tool.get("next")})
+    capability_result = capability_search(" ".join(keyword_args), limit=min(10, limit))
+    if capability_result:
+        backend = capability_result.get("source") or capability_result.get("mode")
+        for rank, card in enumerate(capability_result.get("matches", []), 1):
+            entrypoints = card.get("entrypoints") or []
+            next_cmd = (entrypoints[0] if card.get("callable") and entrypoints else
+                        "describe_tool %s" % shlex.quote(card.get("tool_id", "")))
+            payload.append({
+                "kind": "capability", "score": 150 - rank,
+                "matched": card.get("aliases") or [],
+                "card_id": card.get("card_id"), "tool_id": card.get("tool_id"),
+                "capability_id": card.get("capability_id"), "title": card.get("title"),
+                "what": card.get("intent"), "scenarios": card.get("scenarios") or [],
+                "anti_scenarios": card.get("anti_scenarios") or [],
+                "status": card.get("status"), "tier": card.get("tier"),
+                "callable": card.get("callable"), "evidence": card.get("evidence") or [],
+                "retrieval_backend": backend,
+                "semantic_score": card.get("semantic_score"),
+                "next": next_cmd,
+            })
+    pg = pager.WorkspacePager()
+    assets_by_id = {a.get("asset_id"): a for a in cache.get("assets", [])}
+    grouped_files = {}
+    for file_hit in pg.search_asset_files(kws, limit=max(100, limit * 20)):
+        grouped_files.setdefault(file_hit["asset_id"], []).append(file_hit)
+    for asset_id, file_hits in grouped_files.items():
+        asset = assets_by_id.get(asset_id, {})
+        confirmed = bool(asset.get("cloud_verified"))
+        payload.append({
+            "kind": "cloud_file", "score": (60 if confirmed else 25) + 5 * len(kws),
+            "matched": kws, "asset_id": asset_id, "host": asset.get("host"),
+            "path": asset.get("original_path"), "relative_path": file_hits[0]["relative_path"],
+            "file_matches": file_hits[:10], "match_count": len(file_hits),
+            "what": asset.get("description"), "size_bytes": file_hits[0]["size_bytes"],
+            "cloud_verified": confirmed,
+            "restore_verified": asset.get("restore_verified"),
+            "search_backend": file_hits[0].get("search_backend"),
+            "next": "ws page enter --asset-id %s" % shlex.quote(asset_id),
+        })
+    payload.sort(key=lambda x: (-x["score"], x["kind"], x.get("path") or ""))
+    payload = payload[:limit]
+    if as_json:
+        print(json.dumps({"query": " ".join(keyword_args),
+                          "cache_status": cache.get("cache_status"),
+                          "capability_retrieval": ({
+                              "source": capability_result.get("source"),
+                              "mode": capability_result.get("mode"),
+                              "engine": capability_result.get("engine"),
+                              "package_version": capability_result.get("package_version"),
+                              "semantic_status": capability_result.get("semantic_status"),
+                              "embedding_model": capability_result.get("embedding_model"),
+                              "embedding_device": capability_result.get("embedding_device"),
+                          } if capability_result else {"source": None, "mode": "unavailable"}),
+                          "matches": payload},
+                         ensure_ascii=False, indent=2))
+        return 0
+    if not payload:
+        print("NO_MATCH")
+        print("目录与云资产索引均未命中；再用 memory-service 理解同义表达，或 ws map 查看全貌。")
+        return 0
+    for i, item in enumerate(payload, 1):
+        if item["kind"] == "capability":
+            print("%d. [能力] %s → %s:%s backend=%s" % (
+                i, item.get("title") or item.get("what"), item.get("tool_id"),
+                item.get("capability_id"), item.get("retrieval_backend")))
+            print("   %s" % (item.get("what") or "(无意图说明)"))
+            if item.get("anti_scenarios"):
+                print("   不适用: %s" % "；".join(item["anti_scenarios"][:3]))
+            print("   入口: %s" % item["next"])
+            continue
+        if item["kind"] == "function_tool":
+            print("%d. [Function] %s status=%s tier=%s callable=%s" % (
+                i, item.get("tool_id") or item["repo"], item["status"],
+                item["tier"], item["callable"]))
+            print("   %s" % (item.get("what") or "(无描述)"))
+            print("   下钻: %s" % item["next"])
+            continue
+        if item["kind"] == "cloud_file":
+            print("%d. [云内文件] %s :: %s (同asset命中%d条)" % (
+                i, item["asset_id"], item["relative_path"], item["match_count"]))
+            print("   原根: %s [%s] | 文件大小=%s" % (
+                item["path"], item["host"], item["size_bytes"]))
+            print("   换入: %s" % item["next"])
+            continue
+        if item["kind"] == "cloud_asset":
+            print("%d. [冷资产] %s → %s [%s]" % (
+                i, item["asset_id"], item["path"], item["host"]))
+            print("   %s" % (item["what"] or "(无描述)"))
+            print("   云确认=%s 恢复验收=%s 大小=%s" % (
+                item["cloud_verified"], item["restore_verified"], item["size_bytes"]))
+            print("   换入: %s" % item["next"])
+            continue
+        inferred = " [推断]" if item["domain_source"] == "inferred" else ""
+        peer = " [对侧:%s]" % item["host"] if item["host"] != HOST else ""
+        print("%d. %s%s → %s → %s%s" % (
+            i, item["domain"], inferred, item["pipeline"], item["path"], peer))
+        print("   %s" % (item["what"] or "(未填这是什么)"))
+        print("   下钻: %s" % item["next"])
+        if item["dependencies"]:
+            print("   依赖: %s" % ", ".join(item["dependencies"][:4]))
+    return 0
+
+
+def _resolve_target(cache, target):
+    target_abs = os.path.abspath(os.path.expanduser(target)) if target.startswith(("/", "~", ".")) else None
+    recs = list(cache["records"].values())
+    if target_abs:
+        # 精确本机路径优先信实测,不信可能过期的索引缓存——
+        # 否则 ws new 建区后立刻 ws show 会因缓存里没有/有过期条目而被模糊匹配抢到别的子目录。
+        hp = os.path.join(target_abs, "HANDOFF.md")
+        if os.path.isfile(hp):
+            return build_record_from_file(hp, HOST)
+        for r in recs:
+            if r["path"] == target_abs or r["path"].rstrip("/") == target_abs.rstrip("/"):
+                return r
+    low = target.lower()
+    exact = [r for r in recs if r["name"].lower() == low]
+    if exact:
+        return exact[0]
+    sub = [r for r in recs if low in r["name"].lower() or low in r["path"].lower()]
+    return sub[0] if sub else None
+
+
+def cmd_show(target):
+    cache = load_index()
+    rec = _resolve_target(cache, target)
+    if not rec:
+        print("NO_MATCH: 找不到工作区 '%s'" % target)
+        return 1
+    if not rec.get("has_handoff"):
+        print("%s: 尚无 HANDOFF.md(证据: %s)" % (rec["path"], rec.get("evidence", "")))
+        return 1
+    text = None
+    if rec["host"] == HOST:
+        try:
+            text = open(rec["handoff_path"], encoding="utf-8", errors="replace").read()
+        except OSError:
+            text = None
+    else:
+        text = fetch_remote_file(rec["handoff_path"])
+    if text is not None:
+        parsed = parse_handoff_text(text)
+        print("== 当前态 ==")
+        print(parsed["current_state_raw"] or "(空)")
+        print("")
+        print("== 必用 skill ==")
+        print(parsed["skills_raw"] or "(空)")
+    else:
+        print("(对侧不可达或本机读取失败,展示索引缓存,可能过期)")
+        print("== 当前态(缓存)==")
+        print("这是什么: %s\n产线: %s\n做到哪: %s\n下一道门: %s\n卡点: %s" % (
+            rec.get("what"), rec.get("line"), rec.get("progress"),
+            rec.get("next_gate"), rec.get("blocker")))
+        if rec.get("recent_task"):
+            print("最近任务(缓存): " + recent_task_text(rec))
+        print("")
+        print("== 必用 skill(缓存)==")
+        for s in rec.get("skills", []):
+            print("- %s%s — %s" % ("⭐ " if s.get("star") else "", s["name"], s.get("note", "")))
+    try:
+        pager.WorkspacePager().touch(rec.get("host") or HOST, rec["path"], "ws show")
+    except Exception as exc:
+        print("警告:页表访问记账失败:%s" % exc, file=sys.stderr)
+    return 0
+
+
+def _cross_host_error(path):
+    if IS_MAC and path.startswith("/home/"):
+        return ("跨机路径:%s 属于 hostb,Mac 不能建区/记账。请在 hostb 上跑:\n"
+                "  ssh %s '~/.coldstore/bin/ws ...'" % (path, PEER_SSH))
+    if (not IS_MAC) and path.startswith("/Users/"):
+        return ("跨机路径:%s 属于 Mac,hostb 不能建区/记账。请在 Mac 上跑:\n"
+                "  ssh %s '~/.coldstore/bin/ws ...'" % (path, PEER_SSH))
+    return None
+
+
+def cmd_new(path, name, what, line):
+    path = os.path.abspath(os.path.expanduser(path))
+    err = _cross_host_error(path)
+    if err:
+        print(err)
+        return 2
+    os.makedirs(path, exist_ok=True)
+    hp = os.path.join(path, "HANDOFF.md")
+    ts = time.strftime("%F %H:%M")
+    nm = name or (os.path.basename(path.rstrip("/")) or path)
+    chain = default_chain()
+    content = TEMPLATE.format(name=nm, ts=ts, what=what or "", line=line or "无", chain=chain)
+    try:
+        fd = os.open(hp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        print("HANDOFF.md 已存在,拒绝覆盖: %s" % hp)
+        return 2
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(content)
+    _invalidate_index(hp)
+    print("已建区: %s" % hp)
+    return 0
+
+
+def cmd_log(path, chain, what, why):
+    path = os.path.abspath(os.path.expanduser(path))
+    err = _cross_host_error(path)
+    if err:
+        print(err)
+        return 2
+    hp = os.path.join(path, "HANDOFF.md")
+    ts = time.strftime("%F %H:%M")
+    line_text = "- %s | %s | %s | %s" % (ts, chain, what, why)
+
+    def mutate(lines):
+        return _append_to_block(lines, "修改日志", line_text), "已追加: %s" % line_text
+
+    try:
+        ok, msg = _locked_rewrite(hp, mutate)
+    except ValueError as e:
+        print(str(e))
+        return 1
+    print(msg if ok else ("失败: %s" % msg))
+    if ok:
+        _bus(path, "log", chain=chain, what=what, why=why)
+    return 0 if ok else 1
+
+
+def cmd_state(path, chain, progress, next_gate, blocker, what=None):
+    """原子刷新「当前态」里的任务游标,不覆盖已有富文本现态。
+
+    对 ws new/scaffold 留下的真空字段直接补值；若字段已有单行或缩进续文，
+    保留原文，只更新一条唯一的「最近任务」游标。这样不会拿通用任务摘要
+    覆盖人工维护的多行权威状态，同时新建工作区不再永久停在空模板。
+    """
+    path = os.path.abspath(os.path.expanduser(path))
+    err = _cross_host_error(path)
+    if err:
+        print(err)
+        return 2
+    hp = os.path.join(path, "HANDOFF.md")
+
+    def one_line(value, name, required=False):
+        if value is None:
+            if required:
+                raise ValueError("%s 不能为空" % name)
+            return None
+        value = re.sub(r"\s+", " ", str(value)).strip().replace("|", "／")
+        if required and not value:
+            raise ValueError("%s 不能为空" % name)
+        return value
+
+    try:
+        progress = one_line(progress, "progress", required=True)
+        next_gate = one_line(next_gate, "next_gate", required=True)
+        blocker = one_line(blocker, "blocker")
+        what = one_line(what, "what")
+        chain = one_line(chain, "chain", required=True)
+    except ValueError as e:
+        print("ERROR: %s" % e)
+        return 2
+
+    ts = time.strftime("%F %H:%M")
+    filled = []
+
+    def mutate(lines):
+        idx = _block_ranges(lines)
+        if "当前态" not in idx:
+            raise ValueError("缺块 [当前态],无法刷新")
+        start = idx["当前态"]
+        later = sorted(v for v in idx.values() if v > start)
+        end = later[0] if later else len(lines)
+        out = list(lines)
+        values = {"做到哪": progress, "下一道门": next_gate}
+        if what is not None:
+            values["这是什么"] = what
+        if blocker is not None:
+            values["卡点"] = blocker
+
+        for field, value in values.items():
+            hits = []
+            for i in range(start + 1, end):
+                m = STATE_UPDATE_RE[field].match(out[i])
+                if m:
+                    hits.append((i, m))
+            if not hits:
+                continue
+            i, m = hits[-1]
+            if m.group(2).strip():
+                continue
+            multiline = False
+            for j in range(i + 1, end):
+                nxt = out[j]
+                if not nxt.strip():
+                    continue
+                if any(rx.match(nxt) for rx in STATE_UPDATE_RE.values()):
+                    break
+                if nxt.startswith(("  ", "\t")) or not nxt.startswith(("-", "*", "|", "#")):
+                    multiline = True
+                break
+            if not multiline:
+                out[i] = m.group(1) + value
+                filled.append(field)
+
+        recent = ("- 最近任务:%s | %s | 做到哪:%s | 下一道门:%s%s"
+                  % (ts, chain, progress, next_gate,
+                     (" | 卡点:%s" % blocker) if blocker is not None else ""))
+        recent_hits = [i for i in range(start + 1, end) if RECENT_TASK_RE.match(out[i])]
+        if recent_hits:
+            out[recent_hits[-1]] = recent
+        else:
+            out = _append_to_block(out, "当前态", recent)
+        return out, "已刷新当前任务游标(补空字段:%s)" % (",".join(filled) or "无")
+
+    try:
+        ok, msg = _locked_rewrite(hp, mutate)
+    except ValueError as e:
+        print(str(e))
+        return 1
+    print(msg if ok else ("失败: %s" % msg))
+    if ok:
+        _bus(path, "state", chain=chain, progress=progress,
+             next_gate=next_gate, blocker=blocker, what=what)
+    return 0 if ok else 1
+
+
+def cmd_dep(path, add, chain):
+    """原子、去重地在「当前态」声明一条跨工作区依赖，并同步追加日志。"""
+    path = os.path.abspath(os.path.expanduser(path))
+    err = _cross_host_error(path)
+    if err:
+        print(err)
+        return 2
+    hp = os.path.join(path, "HANDOFF.md")
+    add = os.path.normpath(os.path.expanduser(str(add).strip()))
+    chain = re.sub(r"\s+", " ", str(chain).strip()).replace("|", "／")
+    if not os.path.isabs(add) or add == "/" or "\n" in add or "\r" in add:
+        print("ERROR: --add 必须是具体绝对工作区路径")
+        return 2
+    if not chain:
+        print("ERROR: --chain 不能为空")
+        return 2
+    ts = time.strftime("%F %H:%M")
+
+    def mutate(lines):
+        idx = _block_ranges(lines)
+        if "当前态" not in idx or "修改日志" not in idx:
+            raise ValueError("缺块 [当前态/修改日志],无法声明依赖")
+        start = idx["当前态"]
+        later = sorted(v for v in idx.values() if v > start)
+        end = later[0] if later else len(lines)
+        out = list(lines)
+        dep_i = None
+        deps = []
+        for i in range(start + 1, end):
+            m = DEP_LINE_RE.match(out[i])
+            if not m:
+                continue
+            dep_i = i
+            deps = [os.path.normpath(os.path.expanduser(x.strip()))
+                    for x in re.split(r"[,，]", m.group(2)) if x.strip()]
+            if add in deps:
+                return None, "已存在,未重复添加: %s" % add
+            out[i] = m.group(1) + m.group(2).rstrip() + ", " + add
+            break
+        if dep_i is None:
+            out = _append_to_block(out, "当前态", "- 依赖: %s" % add)
+        log_line = "- %s | %s | 声明当前跨区依赖:%s | 工作区依赖审计" % (ts, chain, add)
+        out = _append_to_block(out, "修改日志", log_line)
+        return out, "已声明依赖: %s" % add
+
+    try:
+        ok, msg = _locked_rewrite(hp, mutate)
+    except ValueError as e:
+        print(str(e))
+        return 1
+    print(msg if ok else ("失败: %s" % msg))
+    if ok:
+        _bus(path, "dep", chain=chain, dependency=add, what="声明依赖 %s" % add)
+    return 0 if ok else 1
+
+
+# ── 事件总线(<date>)──────────────────────────────────────────────────
+# `ws log`/`ws skill` 的结构化副本。HANDOFF.md 正文是给人读的散文,
+# 事件流是给 agent 读的结构 —— 同一次记账两处落地,正文仍是唯一权威。
+# 整段 fail-open:总线挂了绝不让记账失败(记账成功比记事件重要)。
+def _bus(path, ev, **kw):
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import ws_bus
+        kw.setdefault("task", os.environ.get("HD_TASK_ID") or os.environ.get("PAI_TASK_ID"))
+        return ws_bus.emit(path, ev, **kw)
+    except Exception:
+        return False
+
+
+def cmd_brief(path, window, as_json, me, no_peer=False):
+    """ws brief —— agent 协作视图:谁在动/标准变没变/会不会撞车。
+
+    这是「agent 可以直接据此协作」的读出口。转调 ws_bus,不写第二套判据。
+    跨机聚合:对端机器同名工作区的事件流一并展示(走 ssh,不可达静默降级),
+    实现见 ws_bus.brief_with_peer(<date> 任务B)。
+    """
+    path = os.path.abspath(os.path.expanduser(path))
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import ws_bus
+    except Exception as e:
+        print("ERROR: ws_bus 不可用: %r" % e)
+        return 3
+    composite = ws_bus.brief_with_peer(path, window=window, now=time.time(),
+                                       me=me, want_peer=not no_peer)
+    d = composite["local"]
+    pd = composite["peer"]
+    if as_json:
+        out = {"local": d, "peer": pd}
+        print(json.dumps(out, ensure_ascii=False, indent=1, default=str))
+        return 0
+    print("== 工作区活动 %s ==" % path)
+    t = ws_bus.brief_text(path, window=window, now=time.time(), me=me, d=d)
+    if pd and pd.get("n_events"):
+        pt = ws_bus.brief_text(path, window=window, now=time.time(), me=me, d=pd)
+        if pt:
+            t = (t + "\n" if t else "") + ("[对端 %s]\n" % ws_bus.PEER_HOST) + pt
+    print(t if t else "(事件流为空:还没有任何 agent 动作被观测到)")
+    return 0
+
+
+def cmd_skill(path, add, star, note):
+    path = os.path.abspath(os.path.expanduser(path))
+    err = _cross_host_error(path)
+    if err:
+        print(err)
+        return 2
+    hp = os.path.join(path, "HANDOFF.md")
+
+    def mutate(lines):
+        idx = _block_ranges(lines)
+        if "必用skill" not in idx:
+            raise ValueError("缺块 [必用skill],无法追加")
+        start = idx["必用skill"]
+        later = sorted(v for v in idx.values() if v > start)
+        end = later[0] if later else len(lines)
+        for i in range(start + 1, end):
+            s = lines[i].strip()
+            if not s.startswith("-"):
+                continue
+            m = SKILL_RE.match(s)
+            if m and m.group(2).lower() == add.lower():
+                if star and not m.group(1):
+                    stripped = s[1:].strip()
+                    lines[i] = "- ⭐ " + stripped
+                    return lines, "已存在,补标 ⭐: %s" % add
+                return None, "已存在,未重复添加: %s" % add
+        new_line = "- %s`%s`%s" % ("⭐ " if star else "", add,
+                                    (" — %s" % note) if note else "")
+        return _append_to_block(lines, "必用skill", new_line), "已追加: %s" % new_line
+
+    try:
+        ok, msg = _locked_rewrite(hp, mutate)
+    except ValueError as e:
+        print(str(e))
+        return 1
+    print(msg if ok else ("失败: %s" % msg))
+    if ok:
+        _bus(path, "skill", skill=add, what="必用skill +%s" % add, star=bool(star))
+    return 0 if ok else 1
+
+
+def _scaffold_die_help():
+    """若 scaffold 缺失,给一句可执行的恢复指引(不静默 fail)。"""
+    return ("ERROR: handoff_scaffold.py 不存在(%s);" % SCAFFOLD_PATH
+            + " `ws fix` / `ws check` 依赖它。请先 `scp` 同步或在两机任一重新生成。")
+
+
+def cmd_fix(path, force):
+    """ws fix —— 转调 handoff_scaffold.py --fix,只补结构不编内容。"""
+    path = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isdir(path):
+        print("ERROR: %s 不是目录" % path)
+        return 2
+    if not os.path.isfile(SCAFFOLD_PATH):
+        print(_scaffold_die_help())
+        return 3
+    argv = [sys.executable, SCAFFOLD_PATH, "--fix", path]
+    if force:
+        argv.append("--force")
+    print("→ 转调 scaffold --fix %s%s" % (path, " --force" if force else ""))
+    return subprocess.call(argv)
+
+
+def cmd_check(path):
+    """ws check —— 转调 handoff_scaffold.py --check,JSON 报告 + rc。"""
+    path = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isdir(path):
+        print("ERROR: %s 不是目录" % path)
+        return 2
+    if not os.path.isfile(SCAFFOLD_PATH):
+        print(_scaffold_die_help())
+        return 3
+    argv = [sys.executable, SCAFFOLD_PATH, "--check", path]
+    print("→ 转调 scaffold --check %s" % path)
+    return subprocess.call(argv)
+
+
+def cmd_index(rebuild):
+    cache = build_index(force=True) if rebuild else load_index()
+    cache = dict(cache)
+    cache["cache_status"] = _cache_status(cache)
+    recs = list(cache["records"].values())
+    local_n = sum(1 for r in recs if r["host"] == HOST)
+    remote_n = sum(1 for r in recs if r["host"] != HOST)
+    has_n = sum(1 for r in recs if r.get("has_handoff"))
+    print("%s: built_at=%s stale=%s" % (
+        "索引重建完成" if rebuild else "索引缓存状态",
+        time.strftime("%F %T", time.localtime(cache["built_at"])),
+        cache["cache_status"]["stale"]))
+    print("  本机(%s)记录: %d | 对侧(%s)记录: %d(reachable=%s)" % (
+        HOST, local_n, PEER_HOST, remote_n, cache["remote_reachable"]))
+    print("  含 HANDOFF.md: %d | 候选缺失: %d" % (has_n, len(recs) - has_n))
+    ds = cache.get("dispatch_path_stats") or {}
+    if ds:
+        print("  dispatch 路径: 原始 %d | 归属 %d | 未归属 %d | 标准根 %d | 新晋升 %d" % (
+            ds.get("raw_paths", 0), ds.get("attributed_raw_paths", 0),
+            ds.get("unresolved_raw_paths", 0), ds.get("canonical_targets", 0),
+            ds.get("promoted_bare_roots", 0)))
+    print("  缓存文件: %s" % CACHE_FILE)
+    return 0
+
+
+# ============================================================================
+# 自检(<date> operator directive)
+# 设计铁律:
+#   ① 全部跑在 /tmp 下,绝不碰 ~ 下任何真实 HANDOFF.md / workspaces.json
+#   ② 通过短路 CACHE_FILE 全局变量(模块级函数运行时取)避免触碰真实缓存
+#   ③ 不许改任何现有子命令行为/输出(自检是加法,仅 subprocess 调起 ws 触发)
+# 覆盖的不变量(对应 spec 列出的判据):
+#   ① ws new 不覆盖已有 HANDOFF.md,字节数一字不变,exit 2
+#   ② ws new 产出过 lint(同源同进程,生成器-体检器零漂移)
+#   ③ ws log 只追加,前缀保持,可被 DATE_RE + has_chain 识别
+#   ④ ws skill --add 去重 + 永不删除(⭐必留)
+#   ⑤ ≥5 并发 ws log:条目数恰等于进程数,文件不撕裂(flock 真测)
+#   ⑥ 对侧不可达时 ws find 降级为只用本机索引,绝不整体失败
+# 输出 JSON:`{ok, assertions, failed:[...], concurrent_ok}`
+# ============================================================================
+
+def cmd_selftest(json_out=False):
+    """ws --selftest:跑在 /tmp 下的全隔离自检。返回 0=全过,1=有失败。"""
+    import concurrent.futures as _cf
+    import shutil
+    import contextlib
+    import io
+
+    # ---- 临时目录 & 真实缓存 mtime 快照 ----
+    real_cache_path = CACHE_FILE
+    real_cache_existed = os.path.exists(real_cache_path)
+    real_cache_mtime = os.path.getmtime(real_cache_path) if real_cache_existed else None
+    real_cache_size = os.path.getsize(real_cache_path) if real_cache_existed else None
+
+    base = "/tmp/ws_selftest_%d_%d" % (os.getpid(), int(time.time()))
+    os.makedirs(base, exist_ok=False)
+
+    # 把 handoff_lint 注入,拿到与 ws 完全同一套判据(无漂移)
+    _hl_dir = os.path.dirname(LINT_PATH)
+    if _hl_dir not in sys.path:
+        sys.path.insert(0, _hl_dir)
+    import handoff_lint as _hl
+
+    failures = []
+    n_assert = 0
+    concurrent_ok = False
+
+    def _check(cond, msg):
+        nonlocal n_assert
+        n_assert += 1
+        if not cond:
+            failures.append(msg)
+
+    WS_BIN = os.path.abspath(__file__)
+
+    def _run_ws(*args, timeout=30):
+        env = dict(os.environ, WS_SELFTEST="1")
+        return subprocess.run([sys.executable, WS_BIN] + list(args),
+                              capture_output=True, text=True, timeout=timeout, env=env)
+
+    # ---- 工作区目录句柄(给最后清理用,出错也保证存在) ----
+    dir_jobs = []
+
+    # ============ 写路径 ============
+
+    # ① ws new 对已有 HANDOFF.md 绝不覆盖,exit 2,字节数一字不变
+    d_a = os.path.join(base, "a_overwrite")
+    dir_jobs.append(d_a)
+    try:
+        os.makedirs(d_a, exist_ok=False)
+        hp_a = os.path.join(d_a, "HANDOFF.md")
+        with open(hp_a, "w", encoding="utf-8") as f:
+            f.write("# original\nprotected sample\nnot to be touched\n")
+        original = open(hp_a, "rb").read()
+        r = _run_ws("new", d_a, "--what", "x", "--line", "x")
+        post = open(hp_a, "rb").read()
+        _check(r.returncode == 2,
+               "① ws new 已存在应 exit 2 实得 %d; stderr=%s" % (r.returncode, r.stderr[:200]))
+        _check(original == post, "① 已存在 HANDOFF.md 字节被改动")
+    except Exception as e:
+        _check(False, "① 异常: %s" % e)
+
+    # ② ws new 生成的通稿必过 lint(同源判据,零漂移)
+    d_b = os.path.join(base, "b_new_lint")
+    dir_jobs.append(d_b)
+    try:
+        os.makedirs(d_b, exist_ok=False)
+        r = _run_ws("new", d_b, "--what", "selftest", "--line", "selftest")
+        _check(r.returncode == 0, "② ws new 应 exit 0 实得 %d stderr=%s"
+               % (r.returncode, r.stderr[:200]))
+        hp_b = os.path.join(d_b, "HANDOFF.md")
+        defects = _hl.check_handoff(hp_b)
+        _check(defects == [], "② ws new 产出过不了 lint: %s" % defects[:3])
+    except Exception as e:
+        _check(False, "② 异常: %s" % e)
+
+    # ③ ws log 只追加(全文前缀比对),追加行可被 DATE_RE + has_chain 识别
+    d_c = os.path.join(base, "c_log_append")
+    dir_jobs.append(d_c)
+    try:
+        os.makedirs(d_c, exist_ok=False)
+        r0 = _run_ws("new", d_c, "--what", "", "--line", "selftest")
+        _check(r0.returncode == 0, "③ 准备 ws new 失败: rc=%d" % r0.returncode)
+        hp_c = os.path.join(d_c, "HANDOFF.md")
+        before = open(hp_c, encoding="utf-8").read()
+        r = _run_ws("log", d_c, "--chain", "agent-f-worker-llm",
+                    "--what", "日志追加自检", "--why", "selftest")
+        _check(r.returncode == 0, "③ ws log 应 exit 0 实得 %d stderr=%s"
+               % (r.returncode, r.stderr[:200]))
+        after = open(hp_c, encoding="utf-8").read()
+        _check(after.startswith(before), "③ ws log 不应改动既有内容(前缀不一致)")
+        tail = after[len(before):]
+        appended_lines = [ln for ln in tail.splitlines() if ln.strip()]
+        _check(any(_hl.DATE_RE.search(ln[:30]) and _hl.has_chain(ln)
+                   for ln in appended_lines),
+               "③ 追加行必须可被 DATE_RE+has_chain 识别; got 头两行: %s"
+               % appended_lines[:2])
+        rs = _run_ws("state", d_c, "--chain", "agent-f-worker-llm",
+                     "--progress", "自检任务已完成", "--next-gate", "无",
+                     "--what", "自检工作区", "--blocker", "无")
+        _check(rs.returncode == 0, "③b ws state 应 exit 0 实得 %d stderr=%s"
+               % (rs.returncode, rs.stderr[:200]))
+        parsed_c = parse_handoff_text(open(hp_c, encoding="utf-8").read())["fields"]
+        _check(parsed_c["what"] == "自检工作区" and
+               parsed_c["progress"] == "自检任务已完成" and parsed_c["next_gate"] == "无",
+               "③b ws state 应补齐真空现态: %s" % parsed_c)
+        body_c = open(hp_c, encoding="utf-8").read()
+        _check(body_c.count("- 最近任务:") == 1,
+               "③b ws state 应维护唯一最近任务游标")
+        rs2 = _run_ws("state", d_c, "--chain", "agent-f-worker-llm",
+                      "--progress", "第二任务完成", "--next-gate", "复核",
+                      "--blocker", "无")
+        parsed_c2 = parse_handoff_text(open(hp_c, encoding="utf-8").read())["fields"]
+        body_c2 = open(hp_c, encoding="utf-8").read()
+        _check(rs2.returncode == 0 and parsed_c2["progress"] == "自检任务已完成",
+               "③c ws state 不得覆盖已有权威现态: %s" % parsed_c2)
+        _check(body_c2.count("- 最近任务:") == 1 and "做到哪:第二任务完成" in body_c2,
+               "③c ws state 应只替换唯一最近任务游标")
+    except Exception as e:
+        _check(False, "③ 异常: %s" % e)
+
+    # ④ ws skill --add 去重 + 永不删除(⭐保留)
+    d_d = os.path.join(base, "d_skill_dedup")
+    dir_jobs.append(d_d)
+    try:
+        os.makedirs(d_d, exist_ok=False)
+        _run_ws("new", d_d, "--what", "selftest", "--line", "selftest")
+        hp_d = os.path.join(d_d, "HANDOFF.md")
+        _run_ws("skill", d_d, "--add", "foo-skill", "--star", "--note", "首条")
+        first = open(hp_d, encoding="utf-8").read()
+        _check("foo-skill" in first and "⭐" in first,
+               "④ foo-skill/⭐ 首加应可见")
+        # 同名再 add → 文件字节不变,⭐ 仍在
+        _run_ws("skill", d_d, "--add", "foo-skill", "--note", "应忽略")
+        same = open(hp_d, encoding="utf-8").read()
+        _check(same == first, "④ 重复同名 add 不应改动文件(⭐ 必留)")
+        _check("⭐" in same, "④ ⭐ 在重复 add 后丢失")
+        # 加新条目,旧的不被挤掉
+        _run_ws("skill", d_d, "--add", "bar-skill", "--note", "新加")
+        merged = open(hp_d, encoding="utf-8").read()
+        _check("foo-skill" in merged and "bar-skill" in merged,
+               "④ 加新 skill 不应挤掉旧的")
+    except Exception as e:
+        _check(False, "④ 异常: %s" % e)
+
+    # ④b ws dep 只写当前态，去重，并原子追加一条修改日志。
+    d_dep = os.path.join(base, "d_dep_dedup")
+    dir_jobs.append(d_dep)
+    try:
+        os.makedirs(d_dep, exist_ok=False)
+        _run_ws("new", d_dep, "--what", "selftest", "--line", "selftest")
+        peer_dep = os.path.join(base, "peer_workspace")
+        r1 = _run_ws("dep", d_dep, "--add", peer_dep, "--chain", "agent-b-ws")
+        r2 = _run_ws("dep", d_dep, "--add", peer_dep, "--chain", "agent-b-ws")
+        body_dep = open(os.path.join(d_dep, "HANDOFF.md"), encoding="utf-8").read()
+        _check(r1.returncode == 0 and r2.returncode == 0,
+               "④b ws dep 应幂等成功: rc=%s/%s" % (r1.returncode, r2.returncode))
+        _check(body_dep.count("- 依赖: %s" % peer_dep) == 1,
+               "④b 同一依赖应只保留一条")
+        _check(body_dep.count("声明当前跨区依赖:%s" % peer_dep) == 1,
+               "④b 重复调用不应重复写日志")
+        _check(_hl.check_cross_dep(os.path.join(d_dep, "HANDOFF.md"), {d_dep, peer_dep}) is None,
+               "④b ws dep 产出仍被 lint 判未声明")
+    except Exception as e:
+        _check(False, "④b 异常: %s" % e)
+
+    # ============ 并发 ============
+    # ⑤ ≥5 并发 ws log 写同一文件:条目数恰等于进程数,文件不撕裂(flock 真测)
+    d_e = os.path.join(base, "e_concurrent")
+    dir_jobs.append(d_e)
+    try:
+        os.makedirs(d_e, exist_ok=False)
+        _run_ws("new", d_e, "--what", "selftest", "--line", "selftest")
+        hp_e = os.path.join(d_e, "HANDOFF.md")
+        N = 7  # ≥5 满足硬要求
+
+        def _proc(i):
+            return _run_ws("log", d_e, "--chain", "agent-f-worker-llm",
+                           "--what", "并发标记-%d" % i,
+                           "--why", "selftest-concurrent", timeout=30).returncode
+
+        with _cf.ThreadPoolExecutor(max_workers=N) as ex:
+            rcs = list(ex.map(_proc, range(N)))
+        _check(all(rc == 0 for rc in rcs),
+               "⑤ 并发 ws log 出现非 0 退出: %s" % rcs)
+        body_e = open(hp_e, encoding="utf-8").read()
+        count_e = sum(1 for ln in body_e.splitlines() if "并发标记-" in ln)
+        _check(count_e == N, "⑤ 条目数应=%d 实=%d (flock 序列化失效)" % (N, count_e))
+        # 撕裂/不完整行检查
+        bad = []
+        for ln in body_e.splitlines():
+            if ln.startswith("-") and "并发标记-" in ln:
+                if not _hl.DATE_RE.search(ln[:30]) or ln.count("|") < 3:
+                    bad.append(ln[:60])
+        _check(not bad, "⑤ 撕裂/不完整行: %s" % bad[:3])
+        concurrent_ok = (count_e == N) and not bad and all(rc == 0 for rc in rcs)
+    except Exception as e:
+        _check(False, "⑤ 异常: %s" % e)
+
+    # ============ 读路径 / 降级 ============
+    # ⑥ 对侧不可达时 ws find 降级为只用本机索引,绝不一失败
+    # 做法:把模块全局 CACHE_FILE 暂时换成临时 cache(JSON),其 remote_reachable=False;
+    # load_index 一切动作只看我们的 tmp 缓存,真缓存文件从未被读/写。
+    selftest_cache = os.path.join(base, "selftest_cache.json")
+    d_f = os.path.join(base, "f_find_degraded")
+    dir_jobs.append(d_f)
+    try:
+        os.makedirs(d_f, exist_ok=False)
+        cache_f = {
+            "schema_version": INDEX_SCHEMA_VERSION,
+            "built_at": time.time(),
+            "host": HOST,
+            "remote_reachable": False,  # 显式标记模拟 peer down
+            "records": {
+                "%s|%s" % (HOST, d_f): make_bare_record(
+                    d_f, HOST, evidence="selftest-fake-degraded",
+                    priority="P1", verified=False),
+            },
+        }
+        cache_f["graph"] = build_workspace_graph(cache_f["records"])
+        with open(selftest_cache, "w", encoding="utf-8") as f:
+            json.dump(cache_f, f, ensure_ascii=False)
+        # 短路 CACHE_FILE(模块级函数运行时取 globals())
+        saved_cache = globals()['CACHE_FILE']
+        globals()['CACHE_FILE'] = selftest_cache
+        try:
+            stdout_buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(stdout_buf):
+                    rc_find = cmd_find(["f_find_degraded"])
+            except SystemExit as se:
+                # cmd_* 都不应 sys.exit,但保险:不让 selftest 整个崩
+                rc_find = int(getattr(se, "code", 1) or 1)
+            _check(rc_find in (0, 1, 2),
+                   "⑥ peer down 时 ws find 应正常返回, rc=%s;stdout=%s"
+                   % (rc_find, stdout_buf.getvalue()[:200]))
+            # 再读一遍 tmp cache,确认 find 用的是它(没偷偷命中真 cache)
+            tmp_back = json.load(open(selftest_cache, encoding="utf-8"))
+            _check(tmp_back.get("remote_reachable") is False,
+                   "⑥ selftest_cache 应保持 remote_reachable=False 不变")
+        finally:
+            globals()['CACHE_FILE'] = saved_cache
+    except Exception as e:
+        _check(False, "⑥ 异常: %s" % e)
+
+    # ⑦ dispatch 路径只归属到工作区/已验项目根,绝不把产物和环境晋升为工作区。
+    # 这是 <date> 的真故障回归:results.json/report.md/.venv/bin/python/*.pt
+    # 出现在 >=2 个 prompt 后被当成独立候选,长期机制和任务产物混成一层。
+    try:
+        d_g = os.path.join(base, "g_dispatch_ownership")
+        dir_jobs.append(d_g)
+        os.makedirs(d_g, exist_ok=False)
+        known = os.path.join(d_g, "known_workspace")
+        project = os.path.join(d_g, "marked_project")
+        output_only = os.path.join(d_g, "output_only")
+        hidden = os.path.join(d_g, ".venv_like")
+        excluded_repo = os.path.join(d_g, "agent-g-sub", "safe-control-gym")
+        for p in (known, project, output_only, hidden, excluded_repo):
+            os.makedirs(p)
+        os.makedirs(os.path.join(project, ".git"))
+        os.makedirs(os.path.join(hidden, ".git"))
+        os.makedirs(os.path.join(excluded_repo, ".git"))
+        os.makedirs(os.path.join(known, "runs", "r1"))
+        os.makedirs(os.path.join(known, ".venv", "bin"))
+        os.makedirs(os.path.join(project, "results"))
+        os.makedirs(os.path.join(output_only, "runs"))
+
+        known_result = os.path.join(known, "runs", "r1", "results.json")
+        known_python = os.path.join(known, ".venv", "bin", "python")
+        project_model = os.path.join(project, "results", "model.pt")
+        loose_report = os.path.join(output_only, "runs", "report.md")
+        for p in (known_result, known_python, project_model, loose_report):
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("selftest\n")
+
+        fake_records = [{"host": HOST, "path": known}]
+        fake_refs = {
+            known_result: {"tasks": {"t1", "t2"}, "labels": {"a"}, "count": 2},
+            known_python: {"tasks": {"t2", "t3"}, "labels": {"b"}, "count": 2},
+            project_model: {"tasks": {"t4", "t5"}, "labels": {"c"}, "count": 2},
+            loose_report: {"tasks": {"t6", "t7"}, "labels": {"d"}, "count": 2},
+        }
+        grouped_g, stats_g = _aggregate_dispatch_targets(
+            fake_refs, fake_records, local_home=d_g)
+        _check((HOST, known) in grouped_g,
+               "⑦ 已知工作区内 results/.venv 路径应归属到根")
+        _check(len(grouped_g[(HOST, known)]["tasks"]) == 3,
+               "⑦ 同一任务列多个产物应按 task 去重,不应计成4")
+        _check((HOST, project) in grouped_g,
+               "⑦ 未建 HANDOFF 但有 .git 的本机项目可归属到项目根")
+        _check((HOST, project_model) not in grouped_g and
+               (HOST, known_result) not in grouped_g and (HOST, known_python) not in grouped_g,
+               "⑦ 文件/产物/.venv 路径绝不得成为标准工作区根")
+        _check(stats_g["unresolved_raw_paths"] == 1,
+               "⑦ 无项目标记的 output_only 应保持未归属")
+        _check(_local_project_root(os.path.join(hidden, "x.pt"), home=d_g) is None,
+               "⑦ 隐藏/环境根不得因 .git 标记被 prompt 晋升")
+        _check(_local_project_root(os.path.join(excluded_repo, "x.py"), home=d_g) is None,
+               "⑦ 已知依赖根不得因 .git 标记被 prompt 晋升")
+    except Exception as e:
+        _check(False, "⑦ 异常: %s" % e)
+
+    # ⑧ ~/.coldstore 的自动 worktree / 运行态子树只归根工作区，不独立入索引。
+    try:
+        fake_home = os.path.join(base, "h_nonworkspace")
+        _check(_is_nonworkspace_handoff(
+            os.path.join(fake_home, ".coldstore", ".claude", "worktrees", "agent-x", "HANDOFF.md"),
+            home=fake_home), "⑧ 自动 worktree 未被排除")
+        _check(_is_nonworkspace_handoff(
+            os.path.join(fake_home, ".coldstore", "dispatch", "results", "once", "HANDOFF.md"),
+            home=fake_home), "⑧ dispatch result 叶子未被排除")
+        _check(_is_nonworkspace_handoff(
+            os.path.join(fake_home, ".coldstore", "logs", "HANDOFF.md"), home=fake_home),
+            "⑧ logs 运行态目录未被排除")
+        for rel in (".agent-agent-g/HANDOFF.md", ".agent-agent-e/HANDOFF.md",
+                    ".agent-shared/HANDOFF.md", ".coldstore/etc/HANDOFF.md",
+                    ".npm-global/HANDOFF.md", "bin/HANDOFF.md", "snap/HANDOFF.md",
+                    "agent-g-sub/HANDOFF.md", "research-runtime/HANDOFF.md",
+                    "engine-a/engine-a-core/HANDOFF.md",
+                    "task-dir-a/HANDOFF.md", "示例配音目录/HANDOFF.md",
+                    ".codex/HANDOFF.md", ".coldstore/_deleted/HANDOFF.md",
+                    ".coldstore/tmp/HANDOFF.md", "agent-g-venv/HANDOFF.md",
+                    ".coldstore/cron/HANDOFF.md", ".coldstore/plugins/HANDOFF.md",
+                    ".coldstore/profiles/HANDOFF.md", ".coldstore/skills/HANDOFF.md",
+                    ".coldstore/tasks/HANDOFF.md", "skills-core-baks/HANDOFF.md"):
+            _check(_is_nonworkspace_handoff(os.path.join(fake_home, rel), home=fake_home),
+                   "⑧ 非工作区根未被排除: %s" % rel)
+        for rel in ("agent-j", "agent-h"):
+            _check(_is_nonworkspace_handoff(os.path.join(fake_home, rel), home=fake_home),
+                   "⑧ 容器根未被排除: %s" % rel)
+        _check(not _is_nonworkspace_handoff(os.path.join(fake_home, "agent-j", "research"), home=fake_home),
+               "⑧ agent-j 真子工作区被误剪枝")
+        _check(not _is_nonworkspace_handoff(
+            os.path.join(fake_home, "agent-h", "胛七大小便采集指引_WPS终版_工作"), home=fake_home),
+            "⑧ agent-h 真子工作区被误剪枝")
+        _check(not _is_nonworkspace_handoff(
+            os.path.join(fake_home, ".coldstore", "bin", "HANDOFF.md"), home=fake_home),
+            "⑧ 真机制目录 .coldstore/bin 被误排除")
+        copied = os.path.join(fake_home, "github-architecture-sync", "repository", "snapshot", "40_code", "repo")
+        manager = os.path.join(fake_home, "github-architecture-sync")
+        _check(_is_nonworkspace_handoff(os.path.join(copied,"HANDOFF.md"),home=fake_home), "⑧ 备份副本不应成为工作区")
+        _check(not _is_nonworkspace_handoff(os.path.join(manager,"HANDOFF.md"),home=fake_home), "⑧ 备份管理目录必须保留")
+        stale = {"records": {"copy": {"path":copied,"host":HOST}, "manager": {"path":manager,"host":HOST}}, "assets":[]}
+        _check(set(public_index(stale)["records"]) == {"manager"}, "⑧ 已缓存快照也必须从路由移除")
+        remote_entries = [
+            (os.path.join(fake_home, "agent-g-sub", "safe-control-gym", "HANDOFF.md"), "x", 1),
+            (os.path.join(fake_home, "real_workspace", "HANDOFF.md"), "y", 2),
+        ]
+        filtered_entries = _filter_remote_entries(remote_entries, fake_home)
+        _check([e[0] for e in filtered_entries] == [remote_entries[1][0]],
+               "⑧ 远端 HOME 二次过滤未排除依赖根，或误删真工作区")
+    except Exception as e:
+        _check(False, "⑧ 异常: %s" % e)
+
+    # ---- 真实缓存 mtime 安全网(末尾断言) ----
+    if real_cache_existed and real_cache_mtime is not None:
+        try:
+            mtime2 = os.path.getmtime(real_cache_path)
+            size2 = os.path.getsize(real_cache_path)
+            _check(mtime2 == real_cache_mtime and size2 == real_cache_size,
+                   "真实缓存被改动: mtime %s→%s size %s→%s"
+                   % (real_cache_mtime, mtime2, real_cache_size, size2))
+        except Exception:
+            pass
+
+    # ---- 清理(失败的断言也要清) ----
+    try:
+        for dn in dir_jobs:
+            lp = os.path.join(dn, "HANDOFF.md.lock")
+            if os.path.exists(lp):
+                try:
+                    os.remove(lp)
+                except Exception:
+                    pass
+        shutil.rmtree(base)
+    except Exception:
+        pass
+
+    ok = not failures
+    report = {
+        "ok": ok,
+        "assertions": n_assert,
+        "failed": failures,
+        "concurrent_ok": concurrent_ok,
+    }
+    if json_out:
+        sys.stdout.write(json.dumps(report, ensure_ascii=False))
+    else:
+        print("== ws --selftest ==")
+        print("ok=%s assertions=%d concurrent_ok=%s" % (ok, n_assert, concurrent_ok))
+        for f in failures:
+            print("  FAIL: %s" % f)
+        print("")
+        print("提示: HANDOFF.md.lock 是 ws 的 flock 锁残留。")
+        print("      功能上无害(advisory lock,文件不存在也不影响后续 flock),")
+        print("      但 git 仓库请把 '*.lock' 加进 .gitignore 以免误提交。")
+    return 0 if ok else 1
+
+
+# ============================================================================
+# who —— 工作区并发工人占用表(occupancy,<date> operator directive)。每个工作区根下 .ws_workers/<task_id>.json
+# 由 dispatcher.py 派单时写,心跳挂在它已有的轮询循环里续。这里只读、
+# 只在读到过期(心跳超过 WS_WORKER_STALE_SEC 秒没更新)记录时顺手清掉本机的
+# ——这就是租约,任何一方都可以清,不引入任何新依赖。
+# 跨机:同名工作区在对侧机器也可能有工人在跑,读对侧走 ssh,复用的是本文件
+# 已有的 PEER_SSH/ConnectTimeout=6/BatchMode=yes 判据(与 dispatcher.py
+# 的 _ws_probe/_XHOST_BY_PREFIX 同一套家族:固定 host 映射、固定超时、
+# 固定 BatchMode),不新起一套 SSH 逻辑。对侧不可达/无内容 → 降级返回空,
+# 不报错、不影响本机结果。
+# ============================================================================
+WS_WORKERS_DIRNAME = ".ws_workers"
+WS_WORKER_STALE_SEC = 180
+
+
+def _ws_parse_iso(s):
+    if not s:
+        return None
+    try:
+        s2 = s[:-1] if s.endswith("Z") else s
+        return calendar.timegm(time.strptime(s2, "%Y-%m-%dT%H:%M:%S"))
+    except Exception:
+        return None
+
+
+def _ws_rec_age(rec):
+    hb = _ws_parse_iso(rec.get("heartbeat"))
+    return (time.time() - hb) if hb is not None else None
+
+
+def _ws_fmt_age(sec):
+    if sec is None or sec < 0:
+        return "?"
+    sec = int(sec)
+    if sec < 60:
+        return "%ds" % sec
+    if sec < 3600:
+        return "%dm" % (sec // 60)
+    return "%dh" % (sec // 3600)
+
+
+def _ws_load_local_occupancy(path, reap=True):
+    """读本机 path/.ws_workers/*.json。心跳过期的:reap=True 时删文件,
+    两种情况都把该记录归进 reaped 返回(方便调用方打印"已清理"提示)。"""
+    d = os.path.join(path, WS_WORKERS_DIRNAME)
+    alive, reaped = [], []
+    if not os.path.isdir(d):
+        return alive, reaped
+    try:
+        names = sorted(os.listdir(d))
+    except OSError:
+        return alive, reaped
+    for fn in names:
+        if not fn.endswith(".json"):
+            continue
+        fp = os.path.join(d, fn)
+        try:
+            rec = json.load(open(fp, encoding="utf-8"))
+        except Exception:
+            continue
+        rec.setdefault("host", HOST)
+        age = _ws_rec_age(rec)
+        rec["_age"] = age
+        if age is None or age > WS_WORKER_STALE_SEC:
+            if reap:
+                try:
+                    os.remove(fp)
+                except OSError:
+                    pass
+            reaped.append(rec)
+        else:
+            alive.append(rec)
+    return alive, reaped
+
+
+def _ws_peer_occupancy(paths):
+    """跨机批量读对侧同名工作区的 .ws_workers/*.json,一次 ssh 往返。
+    返回 {path: [rec,...]}(只含未过期的活记录);对侧不可达 → {}。"""
+    paths = [p for p in (paths or []) if p]
+    if not paths:
+        return {}
+    parts = []
+    for p in paths:
+        d = os.path.join(p, WS_WORKERS_DIRNAME)
+        parts.append('echo "===WS_WHO==="; echo %s; '
+                      'for f in %s/*.json; do [ -f "$f" ] && cat "$f" && echo; done 2>/dev/null'
+                      % (shlex.quote(p), shlex.quote(d)))
+    sh = "\n".join(parts)
+    try:
+        r = subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=6", "-o", "BatchMode=yes", PEER_SSH,
+             "bash -lc %s" % shlex.quote(sh)],
+            capture_output=True, text=True, timeout=30)
+    except Exception:
+        return {}
+    if r.returncode != 0 and not (r.stdout or "").strip():
+        return {}
+    result, cur = {}, None
+    for line in (r.stdout or "").splitlines():
+        s = line.rstrip("\n")
+        if s == "===WS_WHO===":
+            cur = None
+            continue
+        if cur is None:
+            cur = s
+            result.setdefault(cur, [])
+            continue
+        if s.strip():
+            try:
+                rec = json.loads(s)
+            except Exception:
+                continue
+            rec.setdefault("host", PEER_HOST)
+            age = _ws_rec_age(rec)
+            if age is not None and age <= WS_WORKER_STALE_SEC:
+                rec["_age"] = age
+                result[cur].append(rec)
+    return result
+
+
+def _ws_print_who_block(path, alive, reaped):
+    if not alive and not reaped:
+        print("%s — 当前没有活工人" % path)
+        return
+    print("%s — %d 个活工人" % (path, len(alive)))
+    for rec in sorted(alive, key=lambda r: r.get("started") or ""):
+        print("  [%-4s] %-28s %-20s 心跳 %s前   %s" % (
+            rec.get("host", "?"), rec.get("task_id", "?"),
+            (rec.get("label") or "")[:20], _ws_fmt_age(rec.get("_age")),
+            rec.get("what", "")))
+    for rec in reaped:
+        print("  (已清理 1 个死工人: %s 心跳 %s前)" % (
+            rec.get("task_id", "?"), _ws_fmt_age(rec.get("_age"))))
+
+
+def cmd_who(target):
+    if target:
+        path = os.path.abspath(os.path.expanduser(target))
+        alive, reaped = _ws_load_local_occupancy(path, reap=True)
+        peer = _ws_peer_occupancy([path]).get(path, [])
+        _ws_print_who_block(path, alive + peer, reaped)
+        return 0
+    # 无参数:扫全量索引,只列出当前有活工人的工作区
+    cache = load_index()
+    recs = list(cache["records"].values())
+    local_paths = sorted({r["path"] for r in recs if r["host"] == HOST})
+    remote_paths = sorted({r["path"] for r in recs if r["host"] != HOST})
+    peer_local_dump = _ws_peer_occupancy(local_paths) if local_paths else {}
+    peer_remote_dump = _ws_peer_occupancy(remote_paths) if remote_paths else {}
+    any_hit = False
+    for p in local_paths:
+        alive, reaped = _ws_load_local_occupancy(p, reap=True)
+        alive = alive + peer_local_dump.get(p, [])
+        if alive or reaped:
+            any_hit = True
+            _ws_print_who_block(p, alive, reaped)
+    for p in remote_paths:
+        alive = peer_remote_dump.get(p, [])
+        if alive:
+            any_hit = True
+            _ws_print_who_block(p, alive, [])
+    if not any_hit:
+        print("全量索引扫描完毕:当前没有工作区有活工人。")
+    return 0
+
+
+# ============================================================================
+# Workspace Pager —— existing `ws` command's hot/warm/cold control plane.
+# ============================================================================
+
+def _page_sync(cache):
+    pg = pager.WorkspacePager()
+    pg.sync(cache.get("records", {}), cache.get("assets", []), HOST)
+    # 第三条 sync 路径。<date> 我先只改了 main() 里那两条,是新加的 AST
+    # 用例把这处揪出来的 —— 正是"判据必须守语义而不是守我记得的那几行"。
+    _refresh_liveness_after_sync(pg)
+    return pg
+
+
+def _page_record(cache, target, pg=None):
+    # A page operation is not a search. Never substitute a child whose path
+    # merely contains the requested root (<date> archive starvation).
+    if target.startswith(("/", "~", ".")):
+        absolute = os.path.abspath(os.path.expanduser(target)).rstrip("/") or "/"
+        matches = [r for r in cache.get("records", {}).values()
+                   if r["path"].rstrip("/") == absolute]
+        if not matches and pg is not None:
+            matches = [r for r in pg.status(absolute)["rows"]
+                       if r["path"].rstrip("/") == absolute]
+        if len(matches) > 1:
+            raise pager.PagerRefused("REFUSE_PAGE_TARGET_AMBIGUOUS %s" % target)
+        if matches:
+            return matches[0]
+        hp = os.path.join(absolute, "HANDOFF.md")
+        if os.path.isfile(hp):
+            return build_record_from_file(hp, HOST)
+        raise pager.PagerRefused("REFUSE_PAGE_WORKSPACE_NOT_FOUND %s" % target)
+    rec = _resolve_target(cache, target)
+    if not rec and pg is not None:
+        matches = pg.status(target)["rows"]
+        if len(matches) > 1:
+            raise pager.PagerRefused("REFUSE_PAGE_TARGET_AMBIGUOUS %s" % target)
+        if matches:
+            return matches[0]
+    if not rec:
+        raise pager.PagerRefused("REFUSE_PAGE_WORKSPACE_NOT_FOUND %s" % target)
+    return rec
+
+
+def _page_path_exists(host, path):
+    if host == HOST:
+        return os.path.exists(path)
+    try:
+        r = subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=6", "-o", "BatchMode=yes", PEER_SSH,
+             "test -e %s" % shlex.quote(path)], timeout=10,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _page_archive_root(asset_id):
+    heads = pager.CLOUD_WORKSPACE / "vault_v2_heads.json"
+    if heads.is_file():
+        try:
+            doc = json.loads(heads.read_text(encoding="utf-8"))
+            head = (doc.get("heads") or {}).get(asset_id)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise pager.PagerRefused("REFUSE_VERSION_HEADS_UNREADABLE %s" % exc)
+        if not head or not head.get("root"):
+            raise pager.PagerRefused("REFUSE_ASSET_WITHOUT_CURRENT_HEAD %s" % asset_id)
+        return head["root"]
+    ledger = pager.CLOUD_WORKSPACE / "vault_v2_ledger.tsv"
+    latest = {}
+    try:
+        for line in ledger.read_text(encoding="utf-8").splitlines():
+            cols = line.split("\t")
+            if len(cols) == 12:
+                latest[(cols[1], cols[3])] = cols
+    except OSError as exc:
+        raise pager.PagerRefused("REFUSE_LEDGER_UNREADABLE %s" % exc)
+    roots = {r[1] for r in latest.values() if r[2] == asset_id and r[11] == "CLOUD_CONFIRMED"}
+    if len(roots) != 1:
+        raise pager.PagerRefused(
+            "REFUSE_ARCHIVE_ROOT_COUNT asset=%s count=%d" % (asset_id, len(roots)))
+    return roots.pop()
+
+
+def _page_materialize(asset, restored):
+    archive_root = _page_archive_root(asset["asset_id"])
+    if archive_root.startswith("manifest://"):
+        raise pager.PagerRefused(
+            "REFUSE_MANIFEST_ASSET_WHOLE_MATERIALIZE %s" % asset["asset_id"])
+    original = asset["original_path"]
+    base = os.path.basename(original.rstrip("/"))
+    source = os.path.join(str(restored), base)
+    if not os.path.lexists(source):
+        raise pager.PagerRefused("REFUSE_RESTORE_LAYOUT source_missing=%s" % source)
+    if asset["host"] == HOST:
+        if os.path.lexists(original):
+            raise pager.PagerRefused("REFUSE_MATERIALIZE_TARGET_EXISTS %s" % original)
+        os.makedirs(os.path.dirname(original), exist_ok=True)
+        try:
+            os.replace(source, original)
+        except OSError as exc:
+            raise pager.PagerRefused(
+                "REFUSE_MATERIALIZE_NOT_ATOMIC source=%s target=%s error=%s"
+                % (source, original, exc))
+        return original
+    if HOST != "mac" or asset["host"] != "hostb":
+        raise pager.PagerRefused(
+            "REFUSE_MATERIALIZE_WRONG_CONTROL_HOST current=%s target=%s" % (HOST, asset["host"]))
+    parent = os.path.dirname(original)
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", asset["asset_id"])[:80]
+    stage_parent = os.path.join(parent, ".ws-page-in-%s-%d" % (safe, os.getpid()))
+    pre = (
+        "test ! -e {target} && test ! -e {stage} && "
+        'sudo -n install -d -m 700 -o "$(id -u)" -g "$(id -g)" {stage}'
+    ).format(target=shlex.quote(original), stage=shlex.quote(stage_parent))
+    r = subprocess.run(
+        ["ssh", "-o", "ConnectTimeout=6", "-o", "BatchMode=yes", PEER_SSH, pre],
+        text=True, capture_output=True, timeout=30)
+    if r.returncode != 0:
+        raise pager.PagerRefused(
+            "REFUSE_REMOTE_STAGE_PREP rc=%d stderr=%s" % (r.returncode, r.stderr[-1000:]))
+    tar = subprocess.Popen(
+        ["/usr/bin/tar", "-C", str(restored), "-cf", "-", "--", base],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    # Mac's unprivileged extraction owns the transport cache as its local UID.
+    # Those numeric IDs are not identities on Linux. Public workspace restores
+    # belong to the destination SSH operator, retaining archived file modes.
+    remote_extract = "/usr/bin/tar --no-same-owner --same-permissions -C %s -xf -" % shlex.quote(stage_parent)
+    remote = subprocess.run(
+        ["ssh", "-o", "ConnectTimeout=6", "-o", "BatchMode=yes", PEER_SSH,
+         remote_extract], stdin=tar.stdout, text=False, capture_output=True)
+    assert tar.stdout
+    tar.stdout.close()
+    tar_stderr = tar.stderr.read() if tar.stderr else b""
+    tar_rc = tar.wait()
+    if tar_rc != 0 or remote.returncode != 0:
+        raise pager.PagerRefused(
+            "REFUSE_REMOTE_TRANSFER local_rc=%d remote_rc=%d local=%s remote=%s "
+            "staging_retained=%s" % (
+                tar_rc, remote.returncode, tar_stderr[-1000:].decode(errors="replace"),
+                remote.stderr[-1000:].decode(errors="replace"), stage_parent))
+    staged = os.path.join(stage_parent, base)
+    promote = (
+        "test ! -e {target} && test -e {staged} && "
+        "sudo -n mv -- {staged} {target} && sudo -n rmdir -- {stage}"
+    ).format(target=shlex.quote(original), staged=shlex.quote(staged),
+             stage=shlex.quote(stage_parent))
+    r = subprocess.run(
+        ["ssh", "-o", "ConnectTimeout=6", "-o", "BatchMode=yes", PEER_SSH, promote],
+        text=True, capture_output=True, timeout=60)
+    if r.returncode != 0:
+        raise pager.PagerRefused(
+            "REFUSE_REMOTE_ATOMIC_PROMOTE rc=%d stderr=%s staging_retained=%s"
+            % (r.returncode, r.stderr[-1000:], stage_parent))
+    return original
+
+
+def _page_refresh_materialized_catalog(asset):
+    result = subprocess.run(
+        [sys.executable, str(pager.CLOUD_WORKSPACE / 'cloud_asset_catalog.py')],
+        capture_output=True, text=True, timeout=180)
+    if result.returncode:
+        raise pager.PagerRefused('REFUSE_MATERIALIZED_CATALOG_REFRESH')
+    current = pager.find_asset(pager.load_assets(), asset['asset_id'])
+    if (current.get('original_path') != asset['original_path']
+            or current.get('host') != asset['host']
+            or current.get('local_state') not in {'local', 'replicated'}):
+        raise pager.PagerRefused('REFUSE_MATERIALIZED_CATALOG_PRESENCE')
+
+
+def _page_finish_materialize(pg, asset, restored):
+    """Release the transport cache only after successful atomic placement."""
+    materialized = _page_materialize(asset, restored)
+    _page_refresh_materialized_catalog(asset)
+    pg.mark_materialized(asset["asset_id"], "atomic materialize PASS")
+    pager.discard_restore_cache(asset["asset_id"])
+    return materialized
+
+
+def _semantic_cloud_ingest(incoming_path, timeout):
+    """Merge one staged export and sync the Mac cloud authority under one lock."""
+    if not IS_MAC:
+        raise pager.PagerRefused("REFUSE_SEMANTIC_INGEST_NOT_MAC_AUTHORITY")
+    incoming = pager.Path(incoming_path)
+    temp_roots = {
+        pager.Path(tempfile.gettempdir()).resolve(),
+        pager.Path("/tmp").resolve(),
+    }
+    try:
+        resolved = incoming.resolve(strict=True)
+        stat_result = incoming.lstat()
+    except OSError as exc:
+        raise pager.PagerRefused(
+            "REFUSE_SEMANTIC_INCOMING_UNREADABLE %s: %s" % (incoming, exc)
+        ) from exc
+    if (incoming.is_symlink() or not incoming.is_file() or stat_result.st_uid != os.getuid() or
+            resolved.parent not in temp_roots or not resolved.name.startswith("ws_semantics_")):
+        raise pager.PagerRefused("REFUSE_SEMANTIC_INCOMING_PATH %s" % incoming)
+    authority = pager.CLOUD_WORKSPACE / "workspace_semantics.jsonl"
+    lock_path = pager.CLOUD_WORKSPACE / ".workspace_semantics_sync.lock"
+    try:
+        with lock_path.open("a+", encoding="utf-8") as lock_handle:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            merged = pager.merge_semantic_exports(authority, incoming)
+            outputs = []
+            for tool in (pager.CLOUD_WORKSPACE / "cloud_asset_catalog.py",
+                         pager.CLOUD_WORKSPACE / "vault_v2_sync.py"):
+                if not tool.is_file():
+                    raise pager.PagerRefused(
+                        "REFUSE_SEMANTIC_CLOUD_TOOL_MISSING %s" % tool
+                    )
+                proc = subprocess.run(
+                    [sys.executable, str(tool)], text=True, capture_output=True,
+                    timeout=timeout, stdin=subprocess.DEVNULL,
+                )
+                if proc.returncode:
+                    raise pager.PagerRefused(
+                        "REFUSE_SEMANTIC_CLOUD_SYNC tool=%s rc=%d detail=%s" % (
+                            tool, proc.returncode, (proc.stdout + proc.stderr)[-2000:])
+                    )
+                outputs.append((proc.stdout + proc.stderr).strip()[-1000:])
+            return {"merge": merged, "tools": outputs}
+    finally:
+        # Only the validated, per-call /tmp staging file is removed.  Authority,
+        # source workspaces and cloud copies are never deletion targets here.
+        if incoming.exists() and not incoming.is_symlink():
+            incoming.unlink(missing_ok=True)
+
+
+def _semantic_export_and_sync(pg, timeout):
+    """Export local pager semantics and route them to the Mac authority."""
+    fd, stage_raw = tempfile.mkstemp(prefix="ws_semantics_%s_" % HOST, suffix=".jsonl")
+    os.close(fd)
+    stage = pager.Path(stage_raw)
+    try:
+        exported = pg.export_semantics(stage)
+        if IS_MAC:
+            result = _semantic_cloud_ingest(stage, timeout)
+            stage = None
+            return exported, result
+        mktemp_proc = subprocess.run(
+            ["ssh", "-n", "-o", "ConnectTimeout=6", "-o", "BatchMode=yes",
+             PEER_SSH, "umask 077; mktemp /tmp/ws_semantics_hostb.jsonl.XXXXXX"],
+            text=True, capture_output=True, timeout=15, stdin=subprocess.DEVNULL,
+        )
+        if mktemp_proc.returncode:
+            raise pager.PagerRefused(
+                "REFUSE_SEMANTIC_REMOTE_STAGE rc=%d detail=%s" % (
+                    mktemp_proc.returncode, (mktemp_proc.stdout + mktemp_proc.stderr)[-1000:])
+            )
+        remote_stage = mktemp_proc.stdout.strip()
+        if not remote_stage.startswith("/tmp/ws_semantics_hostb."):
+            raise pager.PagerRefused("REFUSE_SEMANTIC_REMOTE_STAGE_PATH %s" % remote_stage)
+        copy_proc = subprocess.run(
+            ["scp", "-q", "-o", "ConnectTimeout=6", "-o", "BatchMode=yes",
+             str(stage), "%s:%s" % (PEER_SSH, remote_stage)],
+            text=True, capture_output=True, timeout=60, stdin=subprocess.DEVNULL,
+        )
+        if copy_proc.returncode:
+            raise pager.PagerRefused(
+                "REFUSE_SEMANTIC_REMOTE_COPY rc=%d detail=%s" % (
+                    copy_proc.returncode, (copy_proc.stdout + copy_proc.stderr)[-1000:])
+            )
+        remote_cmd = "~/.coldstore/bin/ws page semantic-ingest --incoming %s --timeout %s --json" % (
+            shlex.quote(remote_stage), float(timeout),
+        )
+        sync_proc = subprocess.run(
+            ["ssh", "-n", "-o", "ConnectTimeout=6", "-o", "BatchMode=yes",
+             PEER_SSH, remote_cmd],
+            text=True, capture_output=True, timeout=timeout + 30,
+            stdin=subprocess.DEVNULL,
+        )
+        if sync_proc.returncode:
+            raise pager.PagerRefused(
+                "REFUSE_SEMANTIC_REMOTE_SYNC rc=%d detail=%s" % (
+                    sync_proc.returncode, (sync_proc.stdout + sync_proc.stderr)[-2000:])
+            )
+        return exported, {"remote": sync_proc.stdout.strip()[-2000:]}
+    finally:
+        if stage is not None:
+            stage.unlink(missing_ok=True)
+
+
+# ── ws page status 同步节流(<date>) ──────────────────────────────────
+# sync() 是全机队写操作;status 是只读查询。让只读路径每次都触发全量写,等于
+# 把共享库的写锁按调用频率放大,这是产线级的锁竞争源,不是性能小事。
+_PAGE_SYNC_STAMP = os.path.join(
+    os.path.expanduser("~"), ".coldstore", "state", "ws_page_sync.stamp")
+_PAGE_SYNC_TTL = 300.0
+
+
+def _page_sync_is_fresh():
+    try:
+        return (time.time() - os.stat(_PAGE_SYNC_STAMP).st_mtime) < _PAGE_SYNC_TTL
+    except OSError:
+        return False
+
+
+def _mark_page_synced():
+    try:
+        os.makedirs(os.path.dirname(_PAGE_SYNC_STAMP), exist_ok=True)
+        with open(_PAGE_SYNC_STAMP, "w") as fh:
+            fh.write(str(int(time.time())))
+    except OSError:
+        # 打不上时间戳只会退化成"每次都同步"(即旧行为),不能因此让命令失败。
+        pass
+
+
+def _refresh_liveness_after_sync(pg):
+    """每次真实 sync 之后刷新文件系统活跃度探针。
+
+    <date>:`WorkspacePager.refresh_tree_liveness` 自 <date> 立起,写了
+    实现、配了单测(test_workspace_pager.py 两处 + safety 一处),但**生产路径零
+    调用** —— 全库 grep 只有测试在调。实测后果不是少一条日志:
+
+      · `tree_recent` 全库 2486 行全为 NULL,`TREE_LIVENESS_PROBE` 事件 0 条
+      · plan() 对 local_present=1 的页要求 tree_recent==0 才判 EVICT_CANDIDATE,
+        拿不到探针就恒判 LIVENESS_PROBE_REQUIRED
+      · 于是 519 个页永久出不了候选池,压力淘汰长期"候选 0"饿死,只能靠人手删
+
+    首次真跑(11.85 秒)的判据:LIVENESS_PROBE_REQUIRED 519→213、
+    EVICT_CANDIDATE 0→212、ARCHIVE_CANDIDATE 0→46、候选池 0→127.74 GiB。
+
+    探针自带 6 小时 TTL 且只重探 stale 行,所以挂在每拍 sync 之后是廉价的:
+    稳态 0 次探测,全量首跑 11.85 秒(find -newermt -print -quit 短路)。
+
+    两条刻意的降级语义,别当成疏漏:
+      1) 只读实例直接跳过 —— refresh 要写 tree_recent,只读连接会抛
+         "attempt to write a readonly database",而只读路径本来就不该改状态。
+      2) 探测异常 fail-open(不打崩 ws) —— 探不到时 tree_recent 保持 None,
+         plan() 把该页判回 LIVENESS_PROBE_REQUIRED,即"不淘汰";删除方向
+         本身已经是 fail-closed。为一次 ssh 抖动让整条 ws 命令失败才是事故。
+    """
+    if getattr(pg, "read_only", False):
+        return {"skipped": "read_only"}
+    try:
+        return pg.refresh_tree_liveness()
+    except Exception as exc:  # noqa: BLE001 - 见 docstring 第 2 条降级语义
+        return {"error": type(exc).__name__, "detail": str(exc)[:200]}
+
+
+def _page_status_may_reuse_sync(args):
+    if getattr(args, "page_cmd", None) != "status":
+        return False
+    if os.environ.get("WS_PAGE_FORCE_SYNC") == "1":
+        return False
+    return True
+
+
+def _page_annotation_may_reuse_sync(args):
+    if getattr(args, "page_cmd", None) not in {"annotate", "retry-annotation-sync"}:
+        return False
+    if os.environ.get("WS_PAGE_FORCE_SYNC") == "1":
+        return False
+    return True
+
+
+def _page_touch_may_reuse_sync(args):
+    return (getattr(args, "page_cmd", None) == "touch"
+            and os.environ.get("WS_PAGE_FORCE_SYNC") != "1")
+
+
+def cmd_page(args):
+    if args.page_cmd == "semantic-ingest":
+        result = _semantic_cloud_ingest(args.incoming, args.timeout)
+        print(json.dumps(result, ensure_ascii=False, indent=2) if args.json else
+              "SEMANTIC_CLOUD_SYNC_OK rows=%d" % result["merge"]["rows"])
+        return 0
+    if args.page_cmd == "alerts":
+        pg = pager.WorkspacePager(read_only=True)
+    else:
+        cache = load_index()
+        readonly_status = _page_status_may_reuse_sync(args)
+        pg = pager.WorkspacePager(read_only=readonly_status)
+        # Cloud verification/snapshot proofs can change between graph rebuilds.
+        # Page safety gates must read that authority live instead of reusing a
+        # potentially stale Workspace Graph cache.
+        assets = [] if readonly_status else pager.load_assets()
+    if args.page_cmd == "sync":
+        result = pg.sync(cache.get("records", {}), assets, HOST)
+        # 见 _refresh_liveness_after_sync:没有这一步,plan() 拿不到文件系统证据,
+        # 所有 local_present=1 的页恒判 LIVENESS_PROBE_REQUIRED,候选池永久为空。
+        live = _refresh_liveness_after_sync(pg)
+        result["liveness"] = live
+        result.update({"workspaces": len(cache.get("records", {})), "assets": len(assets)})
+        print(json.dumps(result, ensure_ascii=False, indent=2) if args.json else
+              "PAGE_SYNC workspaces=%d assets=%d mapped=%d liveness_probed=%s live=%s" % (
+                  result["workspaces"], result["assets"], result["mapped"],
+                  live.get("probed", "-"), live.get("live", "-")))
+        return 0
+    if args.page_cmd == "pool":
+        result = pg.pool_status()
+        print(json.dumps(result, ensure_ascii=False, indent=2) if args.json else
+              "PAGE_POOL managed_free=%.4f isolated_free=%.4f evicting=%s migration=%s" % (
+                  result["managed"]["free_ratio"], result["isolated"]["free_ratio"],
+                  result["managed"]["eviction_active"], result["migration_state"]))
+        return 0
+    if args.page_cmd == "alerts":
+        sample = getattr(args, "disk_sample_json", None)
+        if sample is not None:
+            stats = pager.disk_stats_from_sample(json.loads(sample), pg.policy)
+            result = pg.alerts(disk_stats=stats)
+        else:
+            result = pg.alerts()
+        if args.json:
+            print(json.dumps({"alerts": result}, ensure_ascii=False, indent=2))
+        else:
+            for item in result:
+                print("%s\t%s\t%s\t%s" % (
+                    item["level"], item["text"], item["detail"], item["code"]))
+        return 0
+    if args.page_cmd == "eviction-candidates":
+        result = pg.eviction_candidates()
+        print(json.dumps({"candidates": result}, ensure_ascii=False, indent=2))
+        return 0
+    if args.page_cmd == "eviction-blocks":
+        print(json.dumps({"blocks": pg.eviction_blocks()}, ensure_ascii=False, indent=2))
+        return 0
+    if args.page_cmd == "evict-unblock":
+        hit = pg.unblock_eviction(args.asset_id)
+        print("UNBLOCKED %s" % args.asset_id if hit else "NOT_BLOCKED %s" % args.asset_id)
+        return 0 if hit else 1
+    if args.page_cmd == "archive-blocks":
+        print(json.dumps({"blocks": pg.archive_blocks()}, ensure_ascii=False, indent=2))
+        return 0
+    if args.page_cmd == "archive-unblock":
+        hit = pg.unblock_archive(args.workspace_key)
+        print("UNBLOCKED %s" % args.workspace_key if hit else "NOT_BLOCKED %s" % args.workspace_key)
+        return 0 if hit else 1
+    if (_page_status_may_reuse_sync(args) or _page_annotation_may_reuse_sync(args)
+            or _page_touch_may_reuse_sync(args)):
+        # 只读的 status 复用最近一次全量同步:sync() 会重写全部页行,单次占写锁
+        # 30-60s,比 workspace_pager 自己的 busy_timeout(30s) 还长,并发调用方
+        # 必然报 "database is locked"(<date> 题库续采单就是这么挂的)。
+        pass
+    else:
+        pg.sync(cache.get("records", {}), assets, HOST)
+        # 隐式 sync 也要刷探针:压力淘汰那一拍走的正是这条路径,只挂在显式
+        # `ws page sync` 上等于把候选池的生死押在"有人手动敲那条命令"上。
+        _refresh_liveness_after_sync(pg)
+        _mark_page_synced()
+    if args.page_cmd == "status":
+        target = args.target
+        if target and not target.startswith(("mac|", "hostb|")):
+            rec = _resolve_target(cache, target)
+            if rec:
+                target = pager.WorkspacePager.key(rec["host"], rec["path"])
+        result = pg.status(target)
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            print("Workspace Pager: %d页 HOT=%d WARM=%d COLD=%d PINNED=%d free=%d" % (
+                result["count"], result["states"]["HOT"], result["states"]["WARM"],
+                result["states"]["COLD"], result["states"]["PINNED"], result["disk"]["free"]))
+            for row in result["rows"][:100]:
+                print("  %s %-6s %s asset=%s dirty=%s restore=%s" % (
+                    row["host"], row["state"], row["path"], row["cloud_asset_id"] or "-",
+                    row["dirty"], row["restore_verified"]))
+        return 0
+    if args.page_cmd == "plan":
+        result = pg.plan(args.hot_days, args.cold_days)
+        if args.json:
+            print(json.dumps({"plan": result}, ensure_ascii=False, indent=2))
+        else:
+            counts = {}
+            for row in result:
+                counts[row["action"]] = counts.get(row["action"], 0) + 1
+            print("PAGE_PLAN " + " ".join("%s=%d" % x for x in sorted(counts.items())))
+            for row in [x for x in result if x["action"] not in ("KEEP_HOT", "COOL_TO_WARM")][:100]:
+                print("  %s age=%.1fd %s asset=%s" % (
+                    row["action"], row["age_days"], row["path"], row["asset_id"] or "-"))
+        return 0
+    if args.page_cmd == "classify":
+        rec = _resolve_target(cache, args.target)
+        if rec:
+            host, path = rec["host"], rec["path"]
+        else:
+            rows = pg.status(args.target)["rows"]
+            if len(rows) != 1:
+                raise pager.PagerRefused(
+                    "REFUSE_CLASSIFY_TARGET_COUNT target=%s count=%d" % (args.target, len(rows)))
+            host, path = rows[0]["host"], rows[0]["path"]
+        row = pg.set_classification(
+            host, path, args.redundancy_class, args.copies, args.reason)
+        print(json.dumps(row, ensure_ascii=False, indent=2) if args.json else
+              "PAGE_CLASSIFY %s class=%s independent_copies=%d" % (
+                  path, row["redundancy_class"], row["independent_copies"]))
+        return 0
+    if args.page_cmd == "annotate":
+        rec = _resolve_target(cache, args.target)
+        if rec:
+            host, path = rec["host"], rec["path"]
+        else:
+            rows = pg.status(args.target)["rows"]
+            if len(rows) != 1:
+                raise pager.PagerRefused(
+                    "REFUSE_ANNOTATE_TARGET_COUNT target=%s count=%d" % (
+                        args.target, len(rows)))
+            host, path = rows[0]["host"], rows[0]["path"]
+        # annotate is the worker-facing idempotent entrypoint.  The semantic
+        # row is committed before cloud sync, so a transient sync failure
+        # leaves SYNC_FAILED with no unannotated content.  Reissuing the same
+        # command must retry transport rather than demand a new semantic
+        # revision.  A concurrent content write changes the state back to
+        # SEMANTIC_STALE, and mark_annotation_sync_complete then fails closed.
+        status_rows = pg.status(pager.WorkspacePager.key(host, path))["rows"]
+        if len(status_rows) == 1 and status_rows[0]["annotation_status"] == "SYNC_FAILED":
+            exported, cloud_result = _semantic_export_and_sync(pg, args.timeout)
+            row = pg.mark_annotation_sync_complete(
+                host, path, "semantic cloud sync recovered by idempotent annotate")
+            print(json.dumps({"page": row, "semantic_rows_exported": exported,
+                              "semantic_cloud_sync": cloud_result,
+                              "recovered_sync_failure": True},
+                             ensure_ascii=False, indent=2) if args.json else
+                  "PAGE_SEMANTIC_SYNC_RECOVERED %s revision=%d" % (
+                      path, row["semantic_revision"]))
+            return 0
+        if getattr(args, "resolve_multiple", False):
+            # <date> 修:此前这里把 resolve_multiple 直接当 kwarg 传给
+            # pg.annotate(), 而 WorkspacePager.annotate() 根本没有这个形参
+            # —— 上线以来任何人拨这个开关都是当场 TypeError, 一次都没成功过。
+            # (<date> 我报"已加 --resolve-multiple 显式留痕出口"时只改了 CLI 这
+            #  一层, 没做端到端验证, 那句话是嘴报; 今天被一个真按合同去用它的
+            #  worker 撞出来。)
+            # 不改 pager 签名: 它两机 md5 一致, 是语义页的核心机制, 为一个边缘
+            # 手工出口去动它风险不对等。改成复用**已经在维护心跳里每拍跑、且
+            # 当时真把 MULTIPLE 收回 CURRENT 的**那个 resolver。
+            _rm = subprocess.run(
+                [sys.executable,
+                 os.path.expanduser("~/.coldstore/bin/resolve_semantic_page_multiple.py"),
+                 "--host", host, "--path", path, "--actor", args.actor, "--apply"],
+                capture_output=True, text=True)
+            if _rm.returncode != 0:
+                # fail-closed: 收口没成功就不要接着 annotate —— 那只会把一个
+                # 没解开的 MULTIPLE 页写上新指纹, 让下一个人更难查。
+                print("REFUSE_RESOLVE_MULTIPLE: "
+                      + ((_rm.stderr or _rm.stdout or "").strip()[-300:] or "rc=%d" % _rm.returncode),
+                      file=sys.stderr)
+                return 2
+        row = pg.annotate(host, path, args.summary, args.keyword, args.actor,
+                          args.task_id)
+        try:
+            exported, cloud_result = _semantic_export_and_sync(pg, args.timeout)
+        except Exception as exc:
+            pg.mark_annotation_sync_failed(host, path, str(exc))
+            raise
+        print(json.dumps({"page": row, "semantic_rows_exported": exported,
+                          "semantic_cloud_sync": cloud_result},
+                         ensure_ascii=False, indent=2) if args.json else
+              "PAGE_ANNOTATE %s revision=%d fingerprint=%s" % (
+                  path, row["semantic_revision"], row["content_fingerprint"]))
+        return 0
+    if args.page_cmd == "retry-annotation-sync":
+        rec = _resolve_target(cache, args.target)
+        if rec:
+            host, path = rec["host"], rec["path"]
+        else:
+            rows = pg.status(args.target)["rows"]
+            if len(rows) != 1:
+                raise pager.PagerRefused(
+                    "REFUSE_RETRY_SYNC_TARGET_COUNT target=%s count=%d" % (
+                        args.target, len(rows)))
+            host, path = rows[0]["host"], rows[0]["path"]
+        status_rows = pg.status(pager.WorkspacePager.key(host, path))["rows"]
+        if len(status_rows) != 1 or status_rows[0]["annotation_status"] != "SYNC_FAILED":
+            got = status_rows[0]["annotation_status"] if status_rows else "MISSING"
+            raise pager.PagerRefused("REFUSE_PAGE_NOT_SYNC_FAILED status=%s" % got)
+        exported, cloud_result = _semantic_export_and_sync(pg, args.timeout)
+        row = pg.mark_annotation_sync_complete(host, path)
+        print(json.dumps({"page": row, "semantic_rows_exported": exported,
+                          "semantic_cloud_sync": cloud_result},
+                         ensure_ascii=False, indent=2) if args.json else
+              "PAGE_SEMANTIC_SYNC_RECOVERED %s revision=%d" % (
+                  path, row["semantic_revision"]))
+        return 0
+    if args.page_cmd in ("touch", "pin", "unpin"):
+        rec = _page_record(cache, args.target, pg=pg)
+        if args.page_cmd == "touch":
+            row = pg.touch(rec["host"], rec["path"], args.reason, args.lease_hours)
+        else:
+            row = pg.set_pin(rec["host"], rec["path"], args.page_cmd == "pin", args.reason)
+        print(json.dumps(row, ensure_ascii=False, indent=2) if args.json else
+              "PAGE_%s %s state=%s" % (args.page_cmd.upper(), rec["path"], row["state"]))
+        return 0
+    if args.page_cmd in ("preflight", "prepare"):
+        if args.file == "-":
+            text_body = sys.stdin.read(5 * 1024 * 1024 + 1)
+            path = "stdin"
+        else:
+            path = os.path.abspath(os.path.expanduser(args.file))
+            if os.path.getsize(path) > 5 * 1024 * 1024:
+                raise pager.PagerRefused("REFUSE_PREFLIGHT_FILE_TOO_LARGE %s" % path)
+            text_body = open(path, encoding="utf-8", errors="replace").read()
+        if len(text_body.encode("utf-8")) > 5 * 1024 * 1024:
+            raise pager.PagerRefused("REFUSE_PREFLIGHT_TEXT_TOO_LARGE %s" % path)
+        result = pg.requirements_from_text(text_body, assets)
+        for item in result:
+            item["local_present"] = _page_path_exists(item["host"], item["original_path"])
+            item["needs_restore"] = bool(item["cloud_verified"] and not item["local_present"])
+        if args.page_cmd == "prepare":
+            for item in result:
+                asset = pager.find_asset(assets, item["asset_id"])
+                if item["local_present"]:
+                    pg.touch(item["host"], item["original_path"], "PAI page preflight hit")
+                    item["verdict"] = "PAGE_HIT"
+                    continue
+                if not item["cloud_verified"]:
+                    raise pager.PagerRefused(
+                        "REFUSE_REQUIRED_ASSET_NOT_LOCAL_OR_CLOUD %s" % item["asset_id"])
+                if HOST != "mac":
+                    raise pager.PagerRefused("REFUSE_PREPARE_REQUIRES_MAC_CONTROL_PLANE")
+                restored = pager.restore_asset(asset, timeout=args.timeout)
+                pg.mark_restore_verified(asset["asset_id"], "PAI preflight restore PASS")
+                materialized = _page_finish_materialize(pg, asset, restored)
+                item.update({"verdict": "PAGE_IN_PASS", "materialized": materialized})
+        print(json.dumps({"requirements": result}, ensure_ascii=False, indent=2))
+        return 0
+    if args.page_cmd == "archive":
+        rec = _page_record(cache, args.target, pg=pg)
+        cold_days = args.cold_days
+        if cold_days is None:
+            cold_days = float(pg.policy.get("cold_days", pg.policy.get("hot_days", 3)))
+        cmd = [WORKSPACE_ARCHIVE_TOOL, "--host", rec["host"], "--path", rec["path"],
+               "--cold-days", str(cold_days), "--description", args.description]
+        page_rows = pg.status(rec["path"])["rows"]
+        matching_assets = {
+            row["cloud_asset_id"] for row in page_rows
+            if row.get("host") == rec["host"] and row.get("path") == rec["path"]
+            and row.get("cloud_asset_id")
+        }
+        if len(matching_assets) == 1:
+            cmd.extend(["--label", matching_assets.pop()])
+        elif len(matching_assets) > 1:
+            raise pager.PagerRefused("REFUSE_PAGE_ARCHIVE_ASSET_AMBIGUOUS")
+        if args.execute:
+            cmd.append("--execute")
+        proc = subprocess.run(cmd, text=True, capture_output=True, timeout=args.timeout)
+        if proc.returncode:
+            raise pager.PagerRefused(
+                "REFUSE_PAGE_ARCHIVE rc=%d detail=%s" %
+                (proc.returncode, (proc.stdout + proc.stderr)[-4000:]))
+        print(proc.stdout.strip())
+        return 0
+    if args.page_cmd == "verify":
+        asset = pager.find_asset(assets, args.asset_id)
+        if HOST != "mac":
+            raise pager.PagerRefused("REFUSE_VERIFY_REQUIRES_MAC_CONTROL_PLANE")
+        restored = pager.restore_asset(asset, timeout=args.timeout)
+        evidence = "output=%s;stream_hashes_and_tar_pass=true" % restored
+        pager.record_restore_test(asset["asset_id"], evidence)
+        pg.mark_restore_verified(asset["asset_id"], evidence)
+        if not args.keep_cache:
+            pager.discard_restore_cache(asset["asset_id"])
+        print("PAGE_VERIFY_PASS asset=%s cache_retained=%s" %
+              (asset["asset_id"], bool(args.keep_cache)))
+        return 0
+    if args.page_cmd == "enter":
+        rec = _page_record(cache, args.target) if args.target else None
+        if args.asset_id:
+            asset = pager.find_asset(assets, args.asset_id)
+        elif rec:
+            hits = [a for a in assets if a.get("host") == rec.get("host")
+                    and a.get("original_path", "").rstrip("/") == rec["path"].rstrip("/")]
+            if len(hits) != 1:
+                if _page_path_exists(rec["host"], rec["path"]):
+                    row = pg.touch(rec["host"], rec["path"], "ws page enter hit", args.lease_hours)
+                    print("PAGE_HIT path=%s state=%s" % (rec["path"], row["state"]))
+                    return 0
+                raise pager.PagerRefused(
+                    "REFUSE_PAGE_ASSET_COUNT path=%s count=%d" % (rec["path"], len(hits)))
+            asset = hits[0]
+        else:
+            raise pager.PagerRefused("REFUSE_ENTER_NEEDS_TARGET_OR_ASSET")
+        if _page_path_exists(asset["host"], asset["original_path"]):
+            row = pg.touch(asset["host"], asset["original_path"], "ws page enter hit", args.lease_hours)
+            print("PAGE_HIT asset=%s path=%s state=%s" % (
+                asset["asset_id"], asset["original_path"], row["state"]))
+            return 0
+        if HOST != "mac":
+            raise pager.PagerRefused("REFUSE_RESTORE_REQUIRES_MAC_CONTROL_PLANE")
+        restored = pager.restore_asset(asset, timeout=args.timeout)
+        pg.mark_restore_verified(asset["asset_id"], "cloud download+decrypt+tar PASS")
+        if args.cache_only:
+            print("PAGE_RESTORE_PASS asset=%s cache=%s" % (asset["asset_id"], restored))
+            return 0
+        materialized = _page_finish_materialize(pg, asset, restored)
+        print("PAGE_IN_PASS asset=%s path=%s" % (asset["asset_id"], materialized))
+        return 0
+    raise pager.PagerRefused("REFUSE_UNKNOWN_PAGE_COMMAND %s" % args.page_cmd)
+
+
+# ============================================================================
+# main
+# ============================================================================
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="ws", description="工作区索引 CLI —— 规范见 skill `workspace-handoff`")
+    sub = p.add_subparsers(dest="cmd")
+
+    sp = sub.add_parser("find", help="按关键词匹配工作区")
+    sp.add_argument("keywords", nargs="+")
+
+    sub.add_parser("list", help="全量索引一览")
+
+    sp = sub.add_parser("map", help="多级总览:领域→产线→工作区")
+    sp.add_argument("keywords", nargs="*")
+    sp.add_argument("--json", action="store_true")
+    sp.add_argument("--limit", type=int, default=12, help="每领域最多展示的产线数")
+
+    sp = sub.add_parser("route", help="按需求路由到候选工作区并给出下钻命令")
+    sp.add_argument("keywords", nargs="+")
+    sp.add_argument("--json", action="store_true")
+    sp.add_argument("--limit", type=int, default=10)
+
+    sp = sub.add_parser("show", help="打印工作区当前态+必用skill")
+    sp.add_argument("target")
+
+    sp = sub.add_parser("new", help="建区(已有 HANDOFF.md 绝不覆盖)")
+    sp.add_argument("path")
+    sp.add_argument("--name")
+    sp.add_argument("--what", default="")
+    sp.add_argument("--line", default="")
+
+    sp = sub.add_parser("log", help="修改日志追加一行")
+    sp.add_argument("path")
+    sp.add_argument("--chain", required=True)
+    sp.add_argument("--what", required=True)
+    sp.add_argument("--why", required=True)
+
+    sp = sub.add_parser("state", help="原子刷新当前任务游标(补真空现态,不覆盖已有富文本)")
+    sp.add_argument("path")
+    sp.add_argument("--chain", required=True)
+    sp.add_argument("--progress", required=True)
+    sp.add_argument("--next-gate", required=True)
+    sp.add_argument("--what", help="仅在‘这是什么’真空时补值；已有描述绝不覆盖")
+    sp.add_argument("--blocker")
+
+    sp = sub.add_parser("dep", help="原子去重声明当前跨区依赖")
+    sp.add_argument("path")
+    sp.add_argument("--add", required=True, help="被依赖工作区的绝对路径")
+    sp.add_argument("--chain", required=True)
+
+    sp = sub.add_parser("skill", help="必用skill 去重追加")
+    sp.add_argument("path")
+    sp.add_argument("--add", required=True)
+    sp.add_argument("--star", action="store_true")
+    sp.add_argument("--note", default="")
+
+    sp = sub.add_parser("fix", help="HANDOFF.md 缺块补齐(转调 handoff_scaffold.py --fix,只补结构不编内容)")
+    sp.add_argument("path")
+    sp.add_argument("--force", action="store_true",
+                    help="强制重写(正常情况 fix 不改已合规文件)")
+
+    sp = sub.add_parser("check", help="HANDOFF.md 合规检查(转调 handoff_scaffold.py --check,JSON 报告)")
+    sp.add_argument("path")
+
+    sp = sub.add_parser("index", help="重建索引缓存")
+    sp.add_argument("--rebuild", action="store_true")
+
+    sp = sub.add_parser("who", help="工作区并发工人占用表(有几个工人在干活/在干啥/心跳多久前)")
+    sp.add_argument("path", nargs="?", default=None,
+                     help="不给路径 = 扫全量索引,只列当前有活工人的工作区")
+
+    sp = sub.add_parser("brief", help="工作区活动视图(谁在动/标准变没变/会不会撞车),转调 ws_bus")
+    sp.add_argument("path")
+    sp.add_argument("--window", type=float, default=7 * 86400, help="回看窗口秒数,默认 7 天")
+    sp.add_argument("--me", help="我的 task-id/actor,用于把我自己排除出'别人'")
+    sp.add_argument("--json", action="store_true")
+    sp.add_argument("--no-peer", action="store_true",
+                    help="不看对端机器同名工作区(调试/对端不可达时用)")
+
+    sp = sub.add_parser("page", help="热温冷页表、租约、预取和云恢复")
+    page_sub = sp.add_subparsers(dest="page_cmd", required=True)
+    pp = page_sub.add_parser("sync", help="Workspace Graph与云资产目录同步进页表")
+    pp.add_argument("--json", action="store_true")
+    pp = page_sub.add_parser("status", help="页表状态")
+    pp.add_argument("target", nargs="?")
+    pp.add_argument("--json", action="store_true")
+    pp = page_sub.add_parser("plan", help="按逻辑访问时间生成热温冷动作计划")
+    # default=None -> workspace_pager_policy.json decides.  Never hardcode a schedule
+    # here: the retired 15-day literal used to silently override policy on manual runs.
+    pp.add_argument("--hot-days", type=float, default=None)
+    pp.add_argument("--cold-days", type=float, default=None)
+    pp.add_argument("--json", action="store_true")
+    pp = page_sub.add_parser("pool", help="hostb物理隔离池与主冷热池水位")
+    pp.add_argument("--json", action="store_true")
+    pp = page_sub.add_parser("alerts", help="仅输出Pager对用户有意义的异常")
+    pp.add_argument("--json", action="store_true")
+    pp.add_argument("--disk-sample-json", help="复用当前25秒采集轮的双磁盘样本，禁止重复SSH")
+    page_sub.add_parser("eviction-candidates", help="按最低温排序输出可淘汰温盘")
+    page_sub.add_parser("eviction-blocks", help="执行器明确拒绝(REFUSE_*/NO_ELIGIBLE)而被压力淘汰跳过的资产台账")
+    p_unblock = page_sub.add_parser("evict-unblock", help="解除某资产的执行器拒绝记录，使其重新参与压力淘汰")
+    p_unblock.add_argument("asset_id")
+    page_sub.add_parser("archive-blocks", help="归档器确定性拒绝(REFUSE_UNSUPPORTED_DATABASE_SNAPSHOT等)而被归档排空跳过的页台账")
+    p_aunblock = page_sub.add_parser("archive-unblock", help="解除某页的归档拒绝记录(workspace_key=host|path)，使其重新参与归档排空")
+    p_aunblock.add_argument("workspace_key")
+    pp = page_sub.add_parser("classify", help="声明淘汰后仍存在的独立副本数；未分类永不淘汰")
+    pp.add_argument("target")
+    pp.add_argument("--class", dest="redundancy_class", required=True,
+                    choices=("REGENERABLE", "CLOUD_ACCEPTED", "VALUABLE", "IRREPLACEABLE"))
+    pp.add_argument("--copies", type=int, required=True,
+                    help="不含当前本地源、淘汰后仍存在的独立副本数")
+    pp.add_argument("--reason", required=True)
+    pp.add_argument("--json", action="store_true")
+    pp = page_sub.add_parser("annotate", help="对真实改动文件算指纹并原子更新语义索引")
+    pp.add_argument("--resolve-multiple", action="store_true",
+                    help="仅当 semantic_stale_task=MULTIPLE(多个 task 抢过 owner)时,由维护侧显式收口;对其它 owner 不匹配无效")
+    pp.add_argument("target")
+    pp.add_argument("--summary", required=True)
+    pp.add_argument("--keyword", action="append", default=[])
+    pp.add_argument("--actor", required=True)
+    pp.add_argument("--task-id")
+    pp.add_argument("--timeout", type=float, default=900)
+    pp.add_argument("--json", action="store_true")
+    pp = page_sub.add_parser(
+        "retry-annotation-sync",
+        help="幂等重试已落本地、但云同步失败的语义注释；不增加revision",
+    )
+    pp.add_argument("target")
+    pp.add_argument("--timeout", type=float, default=900)
+    pp.add_argument("--json", action="store_true")
+    pp = page_sub.add_parser("semantic-ingest", help=argparse.SUPPRESS)
+    pp.add_argument("--incoming", required=True)
+    pp.add_argument("--timeout", type=float, default=900)
+    pp.add_argument("--json", action="store_true")
+    pp = page_sub.add_parser("touch", help="逻辑访问并取得HOT租约")
+    pp.add_argument("target")
+    pp.add_argument("--reason", default="manual touch")
+    pp.add_argument("--lease-hours", type=float, default=8)
+    pp.add_argument("--json", action="store_true")
+    for name in ("pin", "unpin"):
+        pp = page_sub.add_parser(name, help=("永久驻留" if name == "pin" else "解除永久驻留"))
+        pp.add_argument("target")
+        pp.add_argument("--reason", default="manual %s" % name)
+        pp.add_argument("--json", action="store_true")
+    pp = page_sub.add_parser("enter", help="命中本地即续租；缺页则自动下载、验密、解密和原子物化")
+    pp.add_argument("target", nargs="?")
+    pp.add_argument("--asset-id")
+    pp.add_argument("--cache-only", action="store_true", help="仅恢复到页缓存，不原位物化")
+    pp.add_argument("--lease-hours", type=float, default=8)
+    pp.add_argument("--timeout", type=float, default=24 * 3600)
+    pp = page_sub.add_parser("preflight", help="从任务书提取显式工作区/冷资产依赖")
+    pp.add_argument("--file", required=True)
+    pp = page_sub.add_parser("prepare", help="PAI启动前解析并预取任务书中的冷资产")
+    pp.add_argument("--file", required=True, help="任务书路径；- 表示stdin")
+    pp.add_argument("--timeout", type=float, default=24 * 3600)
+    pp = page_sub.add_parser("archive", help="温页双快照加密归档(冷却窗按策略)；默认shadow且永不删源")
+    pp.add_argument("target")
+    pp.add_argument("--execute", action="store_true", help="执行copy-only归档")
+    pp.add_argument("--cold-days", type=float, default=None)
+    pp.add_argument("--description", default="Workspace Pager automatic cold snapshot")
+    pp.add_argument("--timeout", type=float, default=48 * 3600)
+    pp = page_sub.add_parser("verify", help="真实下载、验密、解密、tar恢复并持久记录PASS")
+    pp.add_argument("--asset-id", required=True)
+    pp.add_argument("--timeout", type=float, default=24 * 3600)
+    pp.add_argument("--keep-cache", action="store_true")
+
+    sub.add_parser("lint", help="转调 handoff_lint.py(原样转发)")
+
+    sp = sub.add_parser("selftest",
+                        help="自检 ws 关键不变量(写/并发/读降级),/tmp 隔离,可加 --json")
+    sp.add_argument("--json", action="store_true",
+                    help="输出 JSON 报告 {ok, assertions, failed, concurrent_ok}")
+    return p
+
+
+def main():
+    argv = sys.argv[1:]
+    if argv and argv[0] == "lint":
+        os.execvp(sys.executable, [sys.executable, LINT_PATH] + argv[1:])
+        return 0  # unreachable
+    # <date>:接受 `ws --selftest [--json]` 形式(短路在 argparse 之前,免去
+    # 与 subparser 互斥的麻烦;`ws selftest` 仍走下面常规分支)
+    if "--selftest" in argv:
+        json_out = "--json" in argv
+        argv = [a for a in argv if a not in ("--selftest", "--json")]
+        return cmd_selftest(json_out=json_out)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.cmd == "find":
+        return cmd_find(args.keywords)
+    if args.cmd == "list":
+        return cmd_list()
+    if args.cmd == "map":
+        return cmd_map(args.keywords, args.json, max(1, min(args.limit, 100)))
+    if args.cmd == "route":
+        return cmd_route(args.keywords, args.json, max(1, min(args.limit, 100)))
+    if args.cmd == "show":
+        return cmd_show(args.target)
+    if args.cmd == "new":
+        return cmd_new(args.path, args.name, args.what, args.line)
+    if args.cmd == "log":
+        return cmd_log(args.path, args.chain, args.what, args.why)
+    if args.cmd == "state":
+        return cmd_state(args.path, args.chain, args.progress, args.next_gate,
+                         args.blocker, args.what)
+    if args.cmd == "dep":
+        return cmd_dep(args.path, args.add, args.chain)
+    if args.cmd == "skill":
+        return cmd_skill(args.path, args.add, args.star, args.note)
+    if args.cmd == "fix":
+        return cmd_fix(args.path, args.force)
+    if args.cmd == "check":
+        return cmd_check(args.path)
+    if args.cmd == "index":
+        return cmd_index(args.rebuild)
+    if args.cmd == "who":
+        return cmd_who(args.path)
+    if args.cmd == "brief":
+        return cmd_brief(args.path, args.window, args.json, args.me, args.no_peer)
+    if args.cmd == "page":
+        return cmd_page(args)
+    if args.cmd == "selftest":
+        return cmd_selftest(json_out=args.json)
+    parser.print_help()
+    return 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main() or 0)
+    except pager.PagerRefused as exc:
+        print(str(exc))
+        sys.exit(2)
+    except KeyboardInterrupt:
+        sys.exit(130)

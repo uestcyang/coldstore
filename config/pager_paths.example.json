@@ -1,0 +1,11 @@
+{
+  "_comment": "Deployment-specific pin lists. Copy to config/pager_paths.json or point COLDSTORE_PAGER_PATHS at your own file. Paths may use ~.",
+  "read_only_engine_paths": [
+    "/home/user/engine-a", "/home/user/engine-b", "/home/user/engine-c",
+    "/home/user/engine-d", "/home/user/model-cache", "~/engine-e"
+  ],
+  "auto_pin_paths": [
+    "/home/user/tools", "/home/user/live-service", "/home/user/research-desk/reviews",
+    "/home/user/pipeline/resume-state", "/home/user/示例题库/整理"
+  ]
+}
