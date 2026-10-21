@@ -1,4 +1,10 @@
-# coldstore — virtual memory for agent workspaces: a Pager with proof-gated eviction and an encrypted cloud cold tier
+# coldstore: Safe Cold Storage for AI Agent Workspaces
+
+**Hot/warm/cold workspace tiering for multi-agent systems.** Coldstore helps keep local disks usable by moving inactive agent project directories into an encrypted cloud cold tier. Its core design is **proof-gated eviction**: refuse source deletion unless archive identity, cloud confirmation, snapshot consistency, and path/process safety checks all pass.
+
+**Who it's for:** teams running many local AI agents, GPU hosts with limited storage, and developers who want auditable, fail-closed workspace eviction rather than a general-purpose backup utility. **Try it safely:** start with `python3 pager/ws page plan --json` to inspect proposed moves before enabling any destructive operations.
+
+**Related project:** [DeepMemo](https://github.com/uestcyang/deepmemo) manages *persistent semantic memories and changing facts*; coldstore manages *workspace files and storage tiers*.
 
 `coldstore` is the storage-tier control plane extracted from a two-host, multi-agent
 production setup (a macOS control host + a Linux GPU/storage host). It answers one
