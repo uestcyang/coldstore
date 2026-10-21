@@ -6,6 +6,8 @@
 
 **Related project:** [DeepMemo](https://github.com/uestcyang/deepmemo) manages *persistent semantic memories and changing facts*; coldstore manages *workspace files and storage tiers*.
 
+**Mobile companion:** [Phone Agent](https://github.com/uestcyang/phone-agent) provides a self-hosted Android client and durable transport for your native agent CLI. Pair a phone, submit tasks, reconnect and retrieve output files. It is an independent MIT-licensed core source release, not a required dependency of coldstore.
+
 `coldstore` is the storage-tier control plane extracted from a two-host, multi-agent
 production setup (a macOS control host + a Linux GPU/storage host). It answers one
 question deterministically: **which directories may leave local disk, when, and what
